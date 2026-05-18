@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: shlyapcord-server
+
+server:
+  port: ${SERVER_PORT:8080}
+
+shlyapcord:
+  invites: ${INVITE_TOKENS:local-dev}
+  cors-origins: ${CORS_ORIGINS:*}
+  ice:
+    stun-url: ${STUN_URL:stun:stun.l.google.com:19302}
+    turn-url: ${TURN_URL:}
+    turn-username: ${TURN_USERNAME:}
+    turn-credential: ${TURN_CREDENTIAL:}
