@@ -1,6 +1,7 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Headphones, Mic, MicOff, PhoneOff, Settings, Users } from "lucide-react";
+import { DeepFilterNet3Core } from "deepfilternet3-noise-filter";
 import { loadRnnoise, RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import rnnoiseSimdWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
@@ -31,6 +32,8 @@ type RemoteAudio = {
   gain?: GainNode;
 };
 
+type NoiseMode = "dfn3" | "rnnoise" | "browser";
+
 const inviteToken = readInviteToken();
 const DEFAULT_VOICE_ROOM_NAME = "Голосовая комната";
 const MIC_GAIN_PERCENT = 1000;
@@ -54,13 +57,20 @@ function App() {
   const [inVoice, setInVoice] = useState(false);
   const [muted, setMuted] = useState(false);
   const [iceConfig, setIceConfig] = useState<IceConfig>({ iceServers: [] });
-  const [noiseStatus, setNoiseStatus] = useState("RNNoise");
+  const [noiseStatus, setNoiseStatus] = useState("DeepFilterNet3");
+  const [noiseMode, setNoiseMode] = useState<NoiseMode>("dfn3");
   const [userVolumes, setUserVolumes] = useState<Record<string, number>>({});
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [inviteStatus, setInviteStatus] = useState<"checking" | "valid" | "forbidden">(
+    inviteToken ? "checking" : "forbidden"
+  );
   const socketRef = useRef<WebSocket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const rawStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const deepFilterRef = useRef<DeepFilterNet3Core | null>(null);
+  const deepFilterNodeRef = useRef<AudioWorkletNode | null>(null);
   const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
   const micGainNodeRef = useRef<GainNode | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -77,6 +87,13 @@ function App() {
       .then((response) => response.json())
       .then((config: IceConfig) => setIceConfig(config))
       .catch(() => setIceConfig({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
+
+    if (inviteToken) {
+      fetch(`/api/invites/${encodeURIComponent(inviteToken)}`)
+        .then((response) => response.json())
+        .then((payload: { valid: boolean }) => setInviteStatus(payload.valid ? "valid" : "forbidden"))
+        .catch(() => setInviteStatus("forbidden"));
+    }
 
     return () => {
       leaveVoice();
@@ -337,6 +354,11 @@ function App() {
     const rawStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
     rawStreamRef.current = rawStream;
 
+    if (noiseMode === "browser") {
+      setNoiseStatus("Browser audio");
+      return createGainOnlyStream(rawStream);
+    }
+
     try {
       if (!("AudioWorkletNode" in window)) {
         throw new Error("AudioWorklet is not supported");
@@ -346,48 +368,119 @@ function App() {
       audioContextRef.current = audioContext;
       await audioContext.resume();
 
-      const wasmBinary = await loadRnnoise({
-        url: rnnoiseWasmPath,
-        simdUrl: rnnoiseSimdWasmPath
+      if (noiseMode === "rnnoise") {
+        return await createRnnoiseStream(rawStream, audioContext);
+      }
+
+      return await createDeepFilterStream(rawStream, audioContext);
+    } catch (error) {
+      console.warn("Noise filter failed, using browser audio with gain", error);
+      setNoiseStatus("Browser audio");
+      return createGainOnlyStream(rawStream);
+    }
+  }
+
+  async function createDeepFilterStream(rawStream: MediaStream, audioContext: AudioContext) {
+      const deepFilter = new DeepFilterNet3Core({
+        sampleRate: 48000,
+        noiseReductionLevel: 80,
+        assetConfig: {
+          cdnUrl: "/deepfilternet3"
+        }
       });
-      await audioContext.audioWorklet.addModule(rnnoiseWorkletPath);
+      await deepFilter.initialize();
+      const deepFilterNode = await deepFilter.createAudioWorkletNode(audioContext);
 
       const source = audioContext.createMediaStreamSource(rawStream);
-      const rnnoise = new RnnoiseWorkletNode(audioContext, {
-        wasmBinary,
-        maxChannels: 1
-      });
       const micGain = audioContext.createGain();
       const destination = audioContext.createMediaStreamDestination();
 
       micGain.gain.value = MIC_GAIN_PERCENT / 100;
-      source.connect(rnnoise).connect(micGain).connect(destination);
-      rnnoiseNodeRef.current = rnnoise;
+      source.connect(deepFilterNode).connect(micGain).connect(destination);
+      deepFilterRef.current = deepFilter;
+      deepFilterNodeRef.current = deepFilterNode;
       micGainNodeRef.current = micGain;
-      setNoiseStatus("RNNoise");
+      setNoiseStatus("DeepFilterNet3");
 
       return destination.stream;
-    } catch (error) {
-      console.warn("RNNoise failed, using browser audio", error);
-      setNoiseStatus("Browser audio");
-      return rawStream;
-    }
+  }
+
+  async function createRnnoiseStream(rawStream: MediaStream, audioContext: AudioContext) {
+    const wasmBinary = await loadRnnoise({
+      url: rnnoiseWasmPath,
+      simdUrl: rnnoiseSimdWasmPath
+    });
+    await audioContext.audioWorklet.addModule(rnnoiseWorkletPath);
+
+    const source = audioContext.createMediaStreamSource(rawStream);
+    const rnnoise = new RnnoiseWorkletNode(audioContext, {
+      wasmBinary,
+      maxChannels: 1
+    });
+    const micGain = audioContext.createGain();
+    const destination = audioContext.createMediaStreamDestination();
+
+    micGain.gain.value = MIC_GAIN_PERCENT / 100;
+    source.connect(rnnoise).connect(micGain).connect(destination);
+    rnnoiseNodeRef.current = rnnoise;
+    micGainNodeRef.current = micGain;
+    setNoiseStatus("RNNoise");
+
+    return destination.stream;
+  }
+
+  function createGainOnlyStream(rawStream: MediaStream) {
+    const audioContext = new AudioContext({ sampleRate: 48000 });
+    const source = audioContext.createMediaStreamSource(rawStream);
+    const micGain = audioContext.createGain();
+    const destination = audioContext.createMediaStreamDestination();
+    micGain.gain.value = MIC_GAIN_PERCENT / 100;
+    source.connect(micGain).connect(destination);
+    audioContextRef.current = audioContext;
+    micGainNodeRef.current = micGain;
+    return destination.stream;
   }
 
   function stopLocalAudio() {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     rawStreamRef.current?.getTracks().forEach((track) => track.stop());
+    deepFilterRef.current?.destroy();
+    deepFilterNodeRef.current?.disconnect();
     rnnoiseNodeRef.current?.destroy();
     micGainNodeRef.current?.disconnect();
     audioContextRef.current?.close();
     localStreamRef.current = null;
     rawStreamRef.current = null;
+    deepFilterRef.current = null;
+    deepFilterNodeRef.current = null;
     rnnoiseNodeRef.current = null;
     micGainNodeRef.current = null;
     audioContextRef.current = null;
   }
 
   if (!currentUser) {
+    if (inviteStatus === "checking") {
+      return (
+        <main className="shell login-shell">
+          <section className="forbidden-panel">
+            <p className="eyebrow">Shlyapcord</p>
+            <h1>Checking invite</h1>
+          </section>
+        </main>
+      );
+    }
+
+    if (inviteStatus === "forbidden") {
+      return (
+        <main className="shell login-shell">
+          <section className="forbidden-panel">
+            <p className="eyebrow">Shlyapcord</p>
+            <h1>403 Forbidden</h1>
+          </section>
+        </main>
+      );
+    }
+
     return (
       <main className="shell login-shell">
         <section className="login-panel">
@@ -471,7 +564,7 @@ function App() {
               <button className="icon-button" disabled title="Наушники">
                 <Headphones size={18} />
               </button>
-              <button className="icon-button" disabled title="Настройки">
+              <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Настройки">
                 <Settings size={18} />
               </button>
             </div>
@@ -566,6 +659,36 @@ function App() {
             )}
 
             <button className="modal-close" onClick={() => setSelectedUserId(null)}>
+              Закрыть
+            </button>
+          </section>
+        </div>
+      )}
+
+      {settingsOpen && (
+        <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
+          <section className="settings-modal" onClick={(event) => event.stopPropagation()}>
+            <div>
+              <h3>Настройки</h3>
+              <p>Аудио</p>
+            </div>
+
+            <label className="settings-field">
+              <span>Noise filter</span>
+              <select
+                disabled={inVoice}
+                onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
+                value={noiseMode}
+              >
+                <option value="dfn3">DeepFilterNet3</option>
+                <option value="rnnoise">RNNoise</option>
+                <option value="browser">Browser audio</option>
+              </select>
+            </label>
+
+            {inVoice && <p className="modal-note">Фильтр можно менять только до входа в голос.</p>}
+
+            <button className="modal-close" onClick={() => setSettingsOpen(false)}>
               Закрыть
             </button>
           </section>
