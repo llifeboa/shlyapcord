@@ -1,7 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Headphones, Mic, MicOff, PhoneOff, Settings, Users } from "lucide-react";
-import { DeepFilterNet3Core } from "deepfilternet3-noise-filter";
 import { loadRnnoise, RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import rnnoiseSimdWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
@@ -32,7 +31,19 @@ type RemoteAudio = {
   gain?: GainNode;
 };
 
-type NoiseMode = "dfn3" | "rnnoise" | "browser";
+type NoiseMode = "rnnoise" | "browser";
+type PeerStatus = {
+  connectionState: RTCPeerConnectionState;
+  iceConnectionState: RTCIceConnectionState;
+};
+
+type PeerMetric = {
+  rttMs?: number;
+  packetsLost?: number;
+  packetsReceived?: number;
+  localCandidateType?: string;
+  remoteCandidateType?: string;
+};
 
 const inviteToken = readInviteToken();
 const DEFAULT_VOICE_ROOM_NAME = "Голосовая комната";
@@ -57,20 +68,22 @@ function App() {
   const [inVoice, setInVoice] = useState(false);
   const [muted, setMuted] = useState(false);
   const [iceConfig, setIceConfig] = useState<IceConfig>({ iceServers: [] });
-  const [noiseStatus, setNoiseStatus] = useState("DeepFilterNet3");
-  const [noiseMode, setNoiseMode] = useState<NoiseMode>("dfn3");
+  const [noiseStatus, setNoiseStatus] = useState("RNNoise");
+  const [noiseMode, setNoiseMode] = useState<NoiseMode>("rnnoise");
   const [userVolumes, setUserVolumes] = useState<Record<string, number>>({});
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [voiceDetailsOpen, setVoiceDetailsOpen] = useState(false);
   const [inviteStatus, setInviteStatus] = useState<"checking" | "valid" | "forbidden">(
     inviteToken ? "checking" : "forbidden"
   );
+  const [voiceStatus, setVoiceStatus] = useState("Not connected");
+  const [peerStatuses, setPeerStatuses] = useState<Record<string, PeerStatus>>({});
+  const [peerMetrics, setPeerMetrics] = useState<Record<string, PeerMetric>>({});
   const socketRef = useRef<WebSocket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const rawStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const deepFilterRef = useRef<DeepFilterNet3Core | null>(null);
-  const deepFilterNodeRef = useRef<AudioWorkletNode | null>(null);
   const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
   const micGainNodeRef = useRef<GainNode | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -100,6 +113,19 @@ function App() {
       socketRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (!inVoice) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      void refreshPeerMetrics();
+    }, 2000);
+    void refreshPeerMetrics();
+
+    return () => window.clearInterval(interval);
+  }, [inVoice]);
 
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
@@ -177,11 +203,14 @@ function App() {
   async function joinVoice() {
     setError(null);
     try {
+      setVoiceStatus("Requesting microphone");
       const stream = await createLocalAudioStream();
       localStreamRef.current = stream;
+      setVoiceStatus("Joining voice");
       setInVoice(true);
       send("voice.join", {});
     } catch {
+      setVoiceStatus("Microphone denied");
       setError("Не удалось получить доступ к микрофону");
     }
   }
@@ -190,6 +219,9 @@ function App() {
     send("voice.leave", {});
     setInVoice(false);
     setMuted(false);
+    setVoiceStatus("Not connected");
+    setPeerStatuses({});
+    setPeerMetrics({});
     stopLocalAudio();
     closePeers();
   }
@@ -249,6 +281,7 @@ function App() {
     }
 
     const peer = new RTCPeerConnection(iceConfig);
+    updatePeerStatus(remoteUserId, peer);
     localStreamRef.current?.getTracks().forEach((track) => {
       peer.addTrack(track, localStreamRef.current!);
     });
@@ -265,9 +298,14 @@ function App() {
     });
 
     peer.addEventListener("connectionstatechange", () => {
-      if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
+      updatePeerStatus(remoteUserId, peer);
+      if (["failed", "closed"].includes(peer.connectionState)) {
         closePeer(remoteUserId);
       }
+    });
+
+    peer.addEventListener("iceconnectionstatechange", () => {
+      updatePeerStatus(remoteUserId, peer);
     });
 
     peersRef.current.set(remoteUserId, peer);
@@ -287,6 +325,16 @@ function App() {
       remoteAudio.context?.close();
     }
     remoteAudioRefs.current.delete(userId);
+    setPeerStatuses((previous) => {
+      const next = { ...previous };
+      delete next[userId];
+      return next;
+    });
+    setPeerMetrics((previous) => {
+      const next = { ...previous };
+      delete next[userId];
+      return next;
+    });
   }
 
   function closePeers() {
@@ -364,45 +412,18 @@ function App() {
         throw new Error("AudioWorklet is not supported");
       }
 
+      setVoiceStatus(noiseMode === "rnnoise" ? "Loading RNNoise" : "Loading audio filter");
       const audioContext = new AudioContext({ sampleRate: 48000 });
       audioContextRef.current = audioContext;
       await audioContext.resume();
 
-      if (noiseMode === "rnnoise") {
-        return await createRnnoiseStream(rawStream, audioContext);
-      }
-
-      return await createDeepFilterStream(rawStream, audioContext);
+      return await createRnnoiseStream(rawStream, audioContext);
     } catch (error) {
       console.warn("Noise filter failed, using browser audio with gain", error);
       setNoiseStatus("Browser audio");
+      setVoiceStatus("Noise filter fallback");
       return createGainOnlyStream(rawStream);
     }
-  }
-
-  async function createDeepFilterStream(rawStream: MediaStream, audioContext: AudioContext) {
-      const deepFilter = new DeepFilterNet3Core({
-        sampleRate: 48000,
-        noiseReductionLevel: 80,
-        assetConfig: {
-          cdnUrl: "/deepfilternet3"
-        }
-      });
-      await deepFilter.initialize();
-      const deepFilterNode = await deepFilter.createAudioWorkletNode(audioContext);
-
-      const source = audioContext.createMediaStreamSource(rawStream);
-      const micGain = audioContext.createGain();
-      const destination = audioContext.createMediaStreamDestination();
-
-      micGain.gain.value = MIC_GAIN_PERCENT / 100;
-      source.connect(deepFilterNode).connect(micGain).connect(destination);
-      deepFilterRef.current = deepFilter;
-      deepFilterNodeRef.current = deepFilterNode;
-      micGainNodeRef.current = micGain;
-      setNoiseStatus("DeepFilterNet3");
-
-      return destination.stream;
   }
 
   async function createRnnoiseStream(rawStream: MediaStream, audioContext: AudioContext) {
@@ -444,18 +465,177 @@ function App() {
   function stopLocalAudio() {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     rawStreamRef.current?.getTracks().forEach((track) => track.stop());
-    deepFilterRef.current?.destroy();
-    deepFilterNodeRef.current?.disconnect();
     rnnoiseNodeRef.current?.destroy();
     micGainNodeRef.current?.disconnect();
     audioContextRef.current?.close();
     localStreamRef.current = null;
     rawStreamRef.current = null;
-    deepFilterRef.current = null;
-    deepFilterNodeRef.current = null;
     rnnoiseNodeRef.current = null;
     micGainNodeRef.current = null;
     audioContextRef.current = null;
+  }
+
+  function updatePeerStatus(userId: string, peer: RTCPeerConnection) {
+    setPeerStatuses((previous) => ({
+      ...previous,
+      [userId]: {
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState
+      }
+    }));
+  }
+
+  function connectedPeerCount() {
+    return Object.values(peerStatuses).filter((status) => status.connectionState === "connected").length;
+  }
+
+  function totalPeerCount() {
+    return Object.keys(peerStatuses).length;
+  }
+
+  function voiceDetails() {
+    if (!inVoice) {
+      return "Not connected";
+    }
+    return `${voiceStatus} · ${connectedPeerCount()}/${totalPeerCount()} peers · ${noiseStatus}`;
+  }
+
+  async function refreshPeerMetrics() {
+    const entries = Array.from(peersRef.current.entries());
+    const updates = await Promise.all(
+      entries.map(async ([userId, peer]) => [userId, await readPeerMetric(peer)] as const)
+    );
+
+    setPeerMetrics((previous) => {
+      const next = { ...previous };
+      for (const [userId, metric] of updates) {
+        next[userId] = metric;
+      }
+      return next;
+    });
+  }
+
+  async function readPeerMetric(peer: RTCPeerConnection): Promise<PeerMetric> {
+    const report = await peer.getStats();
+    let selectedPair: any;
+    let inboundAudio: any;
+    let selectedPairId: string | undefined;
+
+    report.forEach((stat: any) => {
+      if (stat.type === "transport" && stat.selectedCandidatePairId) {
+        selectedPairId = stat.selectedCandidatePairId;
+      }
+      if (stat.type === "candidate-pair" && (stat.selected || stat.nominated) && stat.state === "succeeded") {
+        selectedPair = stat;
+      }
+      if (stat.type === "inbound-rtp" && (stat.kind === "audio" || stat.mediaType === "audio") && !stat.isRemote) {
+        inboundAudio = stat;
+      }
+    });
+    if (!selectedPair && selectedPairId) {
+      selectedPair = report.get(selectedPairId);
+    }
+
+    const localCandidate = selectedPair?.localCandidateId ? report.get(selectedPair.localCandidateId) as any : undefined;
+    const remoteCandidate = selectedPair?.remoteCandidateId ? report.get(selectedPair.remoteCandidateId) as any : undefined;
+
+    return {
+      rttMs: selectedPair?.currentRoundTripTime != null ? Math.round(selectedPair.currentRoundTripTime * 1000) : undefined,
+      packetsLost: inboundAudio?.packetsLost,
+      packetsReceived: inboundAudio?.packetsReceived,
+      localCandidateType: localCandidate?.candidateType,
+      remoteCandidateType: remoteCandidate?.candidateType
+    };
+  }
+
+  function averagePingMs() {
+    const values = Object.values(peerMetrics)
+      .map((metric) => metric.rttMs)
+      .filter((value): value is number => typeof value === "number");
+    if (values.length === 0) {
+      return undefined;
+    }
+    return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+  }
+
+  function lastPingMs() {
+    const values = Object.values(peerMetrics)
+      .map((metric) => metric.rttMs)
+      .filter((value): value is number => typeof value === "number");
+    return values[values.length - 1];
+  }
+
+  function outboundPacketLossRate() {
+    const totals = Object.values(peerMetrics).reduce(
+      (acc, metric) => {
+        acc.lost += Math.max(0, metric.packetsLost ?? 0);
+        acc.received += Math.max(0, metric.packetsReceived ?? 0);
+        return acc;
+      },
+      { lost: 0, received: 0 }
+    );
+    const total = totals.lost + totals.received;
+    if (total === 0) {
+      return undefined;
+    }
+    return (totals.lost / total) * 100;
+  }
+
+  function connectionType() {
+    const candidateTypes = Object.values(peerMetrics).flatMap((metric) => [
+      metric.localCandidateType,
+      metric.remoteCandidateType
+    ]);
+    if (candidateTypes.includes("relay")) {
+      return "TURN relay";
+    }
+    if (candidateTypes.includes("srflx")) {
+      return "Direct NAT traversal";
+    }
+    if (candidateTypes.includes("host")) {
+      return "Direct local";
+    }
+    return "Unknown";
+  }
+
+  function voiceQuality() {
+    const ping = averagePingMs();
+    const loss = outboundPacketLossRate();
+    if (ping == null && loss == null) {
+      return "good";
+    }
+    if ((ping ?? 0) >= 250 || (loss ?? 0) >= 10) {
+      return "bad";
+    }
+    if ((ping ?? 0) >= 120 || (loss ?? 0) >= 3) {
+      return "warn";
+    }
+    return "good";
+  }
+
+  function voiceConnectionTitle() {
+    if (voiceStatus !== "Joining voice" && voiceStatus !== "Not connected") {
+      return voiceStatus;
+    }
+    if (connectedPeerCount() === totalPeerCount() && totalPeerCount() > 0) {
+      return "Voice Connected";
+    }
+    if (totalPeerCount() > 0) {
+      return "Connecting";
+    }
+    return "Voice Connected";
+  }
+
+  function voiceConnectionSubtitle() {
+    if (["Requesting microphone", "Loading RNNoise", "Joining voice", "Noise filter fallback"].includes(voiceStatus)) {
+      return voiceStatus;
+    }
+    const ping = averagePingMs();
+    const loss = outboundPacketLossRate();
+    if (ping == null) {
+      return DEFAULT_VOICE_ROOM_NAME;
+    }
+    return `${connectionType()} · ${ping} ms · ${loss?.toFixed(1) ?? "0.0"}% loss`;
   }
 
   if (!currentUser) {
@@ -538,15 +718,18 @@ function App() {
 
         <div className="sidebar-bottom">
           {inVoice && (
-            <div className="voice-connection-card">
+            <button className={`voice-connection-card quality-${voiceQuality()}`} onClick={() => setVoiceDetailsOpen(true)}>
               <div>
-                <div className="voice-connection-title">Voice Connected</div>
-                <div className="voice-connection-room">{DEFAULT_VOICE_ROOM_NAME} · {noiseStatus}</div>
+                <div className="voice-connection-title">{voiceConnectionTitle()}</div>
+                <div className="voice-connection-room">{voiceConnectionSubtitle()}</div>
               </div>
-              <button className="icon-button danger" onClick={leaveVoice} title="Выйти из голоса">
+              <span className="icon-button danger voice-disconnect" onClick={(event) => {
+                event.stopPropagation();
+                leaveVoice();
+              }} title="Выйти из голоса">
                 <PhoneOff size={18} />
-              </button>
-            </div>
+              </span>
+            </button>
           )}
 
           <div className="user-control-bar">
@@ -638,6 +821,12 @@ function App() {
               <div>
                 <h3>{selectedUser.name}</h3>
                 <p>{selectedUser.muted ? "Muted" : "В голосовой комнате"}</p>
+                {selectedUser.id !== currentUser.id && (
+                  <p>
+                    Connection: {peerStatuses[selectedUser.id]?.connectionState ?? "not connected"} · ICE:{" "}
+                    {peerStatuses[selectedUser.id]?.iceConnectionState ?? "new"}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -680,7 +869,6 @@ function App() {
                 onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
                 value={noiseMode}
               >
-                <option value="dfn3">DeepFilterNet3</option>
                 <option value="rnnoise">RNNoise</option>
                 <option value="browser">Browser audio</option>
               </select>
@@ -691,6 +879,35 @@ function App() {
             <button className="modal-close" onClick={() => setSettingsOpen(false)}>
               Закрыть
             </button>
+          </section>
+        </div>
+      )}
+
+      {voiceDetailsOpen && (
+        <div className="modal-backdrop" onClick={() => setVoiceDetailsOpen(false)}>
+          <section className="voice-details-modal" onClick={(event) => event.stopPropagation()}>
+            <div>
+              <h3>Voice Details</h3>
+              <div className="voice-details-tabs">
+                <span>Connection</span>
+                <span>Privacy</span>
+              </div>
+            </div>
+
+            <div className="voice-detail-stats">
+              <p>Average ping: <strong>{averagePingMs() ?? "n/a"}{averagePingMs() != null ? " ms" : ""}</strong></p>
+              <p>Last ping: <strong>{lastPingMs() ?? "n/a"}{lastPingMs() != null ? " ms" : ""}</strong></p>
+              <p>Packet loss rate: <strong>{outboundPacketLossRate()?.toFixed(1) ?? "n/a"}{outboundPacketLossRate() != null ? "%" : ""}</strong></p>
+              <p>Connection type: <strong>{connectionType()}</strong></p>
+              <p>Connections: <strong>{connectedPeerCount()}/{totalPeerCount()}</strong></p>
+              <p>Noise filter: <strong>{noiseStatus}</strong></p>
+            </div>
+
+            <p className="voice-detail-help">
+              If voice is delayed, robotic, or users cannot hear each other, check participant connection states in the user modal.
+            </p>
+
+            <div className="voice-detail-encryption">End-to-end encrypted</div>
           </section>
         </div>
       )}

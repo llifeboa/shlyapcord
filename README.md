@@ -29,9 +29,9 @@ MVP has one default voice room for all invited users.
 
 ## Audio Processing
 
-Microphone audio can be routed through DeepFilterNet3, RNNoise, or browser audio before being sent over WebRTC.
-DeepFilterNet3 is the default mode and its WASM/model assets are served from `apps/web/public/deepfilternet3`.
-If AudioWorklet, WASM, or model initialization fails, the client falls back to browser audio capture with the same mic gain.
+Microphone audio can be routed through RNNoise or browser audio before being sent over WebRTC.
+RNNoise is the default mode.
+If AudioWorklet or WASM initialization fails, the client falls back to browser audio capture with the same mic gain.
 
 ## TURN
 

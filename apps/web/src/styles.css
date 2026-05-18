@@ -271,19 +271,40 @@ input:focus {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 34px;
   align-items: center;
+  justify-content: stretch;
   gap: 8px;
+  width: 100%;
+  min-height: auto;
+  border: 0;
   border-radius: 8px;
   padding: 10px;
   background: #1f272c;
+  cursor: pointer;
+  text-align: left;
+}
+
+.voice-connection-card:hover {
+  background: #252e34;
 }
 
 .voice-connection-title {
   overflow: hidden;
-  color: #63c46d;
   font-size: 14px;
   font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.voice-connection-card.quality-good .voice-connection-title {
+  color: #63c46d;
+}
+
+.voice-connection-card.quality-warn .voice-connection-title {
+  color: #e6c15b;
+}
+
+.voice-connection-card.quality-bad .voice-connection-title {
+  color: #f06f61;
 }
 
 .voice-connection-room {
@@ -293,6 +314,11 @@ input:focus {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.voice-disconnect {
+  display: grid;
+  place-items: center;
 }
 
 .user-control-bar {
@@ -646,6 +672,60 @@ input:focus {
 .settings-field select:disabled {
   color: #65737d;
   cursor: default;
+}
+
+.voice-details-modal {
+  display: grid;
+  gap: 16px;
+  width: min(360px, 100%);
+  border: 1px solid #2a353a;
+  border-radius: 8px;
+  padding: 18px;
+  background: #202126;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.42);
+}
+
+.voice-details-modal h3 {
+  margin: 0 0 14px;
+  font-size: 22px;
+}
+
+.voice-details-tabs {
+  display: flex;
+  gap: 24px;
+  border-bottom: 1px solid #373942;
+  color: #9aa8ae;
+  font-weight: 800;
+}
+
+.voice-details-tabs span:first-child {
+  color: #8fa2ff;
+  border-bottom: 2px solid #8fa2ff;
+  padding-bottom: 10px;
+}
+
+.voice-detail-stats {
+  display: grid;
+  gap: 4px;
+}
+
+.voice-detail-stats p,
+.voice-detail-help {
+  margin: 0;
+  color: #c7d0d4;
+  line-height: 1.35;
+}
+
+.voice-detail-help {
+  color: #9aa8ae;
+}
+
+.voice-detail-encryption {
+  border-top: 1px solid #373942;
+  padding-top: 14px;
+  color: #63c46d;
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .modal-user-header {
