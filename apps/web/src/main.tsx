@@ -33,6 +33,7 @@ type RemoteAudio = {
 
 const inviteToken = readInviteToken();
 const DEFAULT_VOICE_ROOM_NAME = "Голосовая комната";
+const MIC_GAIN_PERCENT = 1000;
 const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     echoCancellation: true,
@@ -61,6 +62,7 @@ function App() {
   const rawStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
+  const micGainNodeRef = useRef<GainNode | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteAudioRefs = useRef<Map<string, RemoteAudio>>(new Map());
 
@@ -355,10 +357,13 @@ function App() {
         wasmBinary,
         maxChannels: 1
       });
+      const micGain = audioContext.createGain();
       const destination = audioContext.createMediaStreamDestination();
 
-      source.connect(rnnoise).connect(destination);
+      micGain.gain.value = MIC_GAIN_PERCENT / 100;
+      source.connect(rnnoise).connect(micGain).connect(destination);
       rnnoiseNodeRef.current = rnnoise;
+      micGainNodeRef.current = micGain;
       setNoiseStatus("RNNoise");
 
       return destination.stream;
@@ -373,10 +378,12 @@ function App() {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     rawStreamRef.current?.getTracks().forEach((track) => track.stop());
     rnnoiseNodeRef.current?.destroy();
+    micGainNodeRef.current?.disconnect();
     audioContextRef.current?.close();
     localStreamRef.current = null;
     rawStreamRef.current = null;
     rnnoiseNodeRef.current = null;
+    micGainNodeRef.current = null;
     audioContextRef.current = null;
   }
 
