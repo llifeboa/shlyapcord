@@ -659,7 +659,8 @@ input:focus {
   font-weight: 800;
 }
 
-.settings-field select {
+.settings-field select,
+.settings-field input {
   width: 100%;
   min-height: 38px;
   border: 1px solid #2a353a;
@@ -667,6 +668,12 @@ input:focus {
   padding: 0 10px;
   color: #eef3f5;
   background: #101518;
+}
+
+.settings-field input[type="range"] {
+  min-height: 20px;
+  accent-color: #68bac2;
+  padding: 0;
 }
 
 .settings-field select:disabled {

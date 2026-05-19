@@ -53,6 +53,8 @@ const MIC_GAIN_PERCENT = 1000;
 const HEARTBEAT_INTERVAL_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = 12000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000];
+const UI_SOUND_VOLUME_STORAGE_KEY = "shlyapcord.uiSoundVolume";
+const DEFAULT_UI_SOUND_VOLUME = 200;
 const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     echoCancellation: true,
@@ -75,6 +77,7 @@ function App() {
   const [iceConfig, setIceConfig] = useState<IceConfig>({ iceServers: [] });
   const [noiseStatus, setNoiseStatus] = useState("RNNoise");
   const [noiseMode, setNoiseMode] = useState<NoiseMode>("rnnoise");
+  const [uiSoundVolume, setUiSoundVolume] = useState(() => readStoredNumber(UI_SOUND_VOLUME_STORAGE_KEY, DEFAULT_UI_SOUND_VOLUME));
   const [userVolumes, setUserVolumes] = useState<Record<string, number>>({});
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -96,6 +99,7 @@ function App() {
   const inVoiceRef = useRef(false);
   const mutedRef = useRef(false);
   const signalingStateRef = useRef<SignalingState>("idle");
+  const uiSoundVolumeRef = useRef(uiSoundVolume);
   const uiAudioContextRef = useRef<AudioContext | null>(null);
   const lastUiSoundAtRef = useRef<Record<UiSound, number>>({
     connect: 0,
@@ -133,6 +137,11 @@ function App() {
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+
+  useEffect(() => {
+    uiSoundVolumeRef.current = uiSoundVolume;
+    window.localStorage.setItem(UI_SOUND_VOLUME_STORAGE_KEY, String(uiSoundVolume));
+  }, [uiSoundVolume]);
 
   useEffect(() => {
     signalingStateRef.current = signalingState;
@@ -628,6 +637,8 @@ function App() {
         ]
       };
 
+      const peakVolume = Math.max(0, Math.min(uiSoundVolumeRef.current, 400)) / 100;
+      const peakGain = Math.max(0.0001, 0.05 * peakVolume);
       for (const [frequency, offset, duration] of patterns[sound]) {
         const oscillator = context.createOscillator();
         const gain = context.createGain();
@@ -637,7 +648,7 @@ function App() {
         oscillator.type = "sine";
         oscillator.frequency.value = frequency;
         gain.gain.setValueAtTime(0.0001, startAt);
-        gain.gain.exponentialRampToValueAtTime(0.05, startAt + 0.015);
+        gain.gain.exponentialRampToValueAtTime(peakGain, startAt + 0.015);
         gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
         oscillator.connect(gain).connect(context.destination);
         oscillator.start(startAt);
@@ -1264,6 +1275,18 @@ function App() {
               </select>
             </label>
 
+            <label className="settings-field">
+              <span>UI sounds: {uiSoundVolume}%</span>
+              <input
+                max={400}
+                min={0}
+                onChange={(event) => setUiSoundVolume(Number(event.target.value))}
+                step={10}
+                type="range"
+                value={uiSoundVolume}
+              />
+            </label>
+
             {inVoice && <p className="modal-note">Фильтр можно менять только до входа в голос.</p>}
 
             <button className="modal-close" onClick={() => setSettingsOpen(false)}>
@@ -1328,6 +1351,16 @@ function readInviteToken() {
 function webSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${window.location.host}/ws`;
+}
+
+function readStoredNumber(key: string, fallback: number) {
+  const value = window.localStorage.getItem(key);
+  if (value == null) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 createRoot(document.getElementById("root")!).render(
