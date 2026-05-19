@@ -1176,7 +1176,7 @@ function App() {
 
         <footer className="voice-footer">
           <span>{voiceUsers.length} в голосе</span>
-          <span>WebRTC media encrypted with DTLS-SRTP</span>
+          <span>Shlyapcord v{__APP_VERSION__}</span>
         </footer>
       </section>
 
