@@ -9,6 +9,9 @@ import dev.shlyapcord.service.UserSessionService;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -16,24 +19,21 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 @Component
+@RequiredArgsConstructor
 public class SignalingWebSocketHandler extends TextWebSocketHandler {
     private final ObjectMapper objectMapper;
     private final InviteService inviteService;
     private final UserSessionService userSessionService;
-
-    public SignalingWebSocketHandler(
-        ObjectMapper objectMapper,
-        InviteService inviteService,
-        UserSessionService userSessionService
-    ) {
-        this.objectMapper = objectMapper;
-        this.inviteService = inviteService;
-        this.userSessionService = userSessionService;
-    }
+    private final ConcurrentMap<String, Object> sendLocks = new ConcurrentHashMap<>();
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         ClientMessage clientMessage = objectMapper.readValue(message.getPayload(), ClientMessage.class);
+        if ("system.ping".equals(clientMessage.getType())) {
+            send(session, "system.pong", Map.of("timestamp", System.currentTimeMillis()));
+            return;
+        }
+
         if ("auth.join".equals(clientMessage.getType())) {
             handleAuthJoin(session, clientMessage.getPayload());
             return;
@@ -58,6 +58,7 @@ public class SignalingWebSocketHandler extends TextWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         UserSession user = userSessionService.removeBySocketSessionId(session.getId()).orElse(null);
+        sendLocks.remove(session.getId());
         if (user != null) {
             broadcast("user.left", Map.of("userId", user.getId()));
             broadcastUsersList();
@@ -158,10 +159,21 @@ public class SignalingWebSocketHandler extends TextWebSocketHandler {
         if (!session.isOpen()) {
             return;
         }
-        session.sendMessage(new TextMessage(objectMapper.writeValueAsString(Map.of(
+        TextMessage message = new TextMessage(objectMapper.writeValueAsString(Map.of(
             "type", type,
             "payload", payload
-        ))));
+        )));
+
+        Object lock = sendLocks.computeIfAbsent(session.getId(), ignored -> new Object());
+        synchronized (lock) {
+            try {
+                if (session.isOpen()) {
+                    session.sendMessage(message);
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // A stale or concurrently closing session must not tear down the sender's handler thread.
+            }
+        }
     }
 
     private String text(JsonNode payload, String field) {

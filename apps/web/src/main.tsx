@@ -32,6 +32,8 @@ type RemoteAudio = {
 };
 
 type NoiseMode = "rnnoise" | "browser";
+type SignalingState = "idle" | "connecting" | "connected" | "reconnecting" | "unavailable";
+type UiSound = "connect" | "reconnect" | "disconnect" | "problem" | "userJoin" | "userLeave" | "mute" | "unmute";
 type PeerStatus = {
   connectionState: RTCPeerConnectionState;
   iceConnectionState: RTCIceConnectionState;
@@ -48,6 +50,9 @@ type PeerMetric = {
 const inviteToken = readInviteToken();
 const DEFAULT_VOICE_ROOM_NAME = "Голосовая комната";
 const MIC_GAIN_PERCENT = 1000;
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 12000;
+const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000];
 const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     echoCancellation: true,
@@ -78,15 +83,37 @@ function App() {
     inviteToken ? "checking" : "forbidden"
   );
   const [voiceStatus, setVoiceStatus] = useState("Not connected");
+  const [signalingState, setSignalingState] = useState<SignalingState>("idle");
   const [peerStatuses, setPeerStatuses] = useState<Record<string, PeerStatus>>({});
   const [peerMetrics, setPeerMetrics] = useState<Record<string, PeerMetric>>({});
   const socketRef = useRef<WebSocket | null>(null);
+  const heartbeatIntervalRef = useRef<number | null>(null);
+  const heartbeatTimeoutRef = useRef<number | null>(null);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const shouldReconnectRef = useRef(false);
+  const currentUserRef = useRef<User | null>(null);
+  const inVoiceRef = useRef(false);
+  const mutedRef = useRef(false);
+  const signalingStateRef = useRef<SignalingState>("idle");
+  const uiAudioContextRef = useRef<AudioContext | null>(null);
+  const lastUiSoundAtRef = useRef<Record<UiSound, number>>({
+    connect: 0,
+    reconnect: 0,
+    disconnect: 0,
+    problem: 0,
+    userJoin: 0,
+    userLeave: 0,
+    mute: 0,
+    unmute: 0
+  });
   const localStreamRef = useRef<MediaStream | null>(null);
   const rawStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
   const micGainNodeRef = useRef<GainNode | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const peerRepairTimersRef = useRef<Map<string, number>>(new Map());
   const remoteAudioRefs = useRef<Map<string, RemoteAudio>>(new Map());
 
   const voiceUsers = useMemo(() => users.filter((user) => user.inVoice), [users]);
@@ -94,6 +121,22 @@ function App() {
     () => users.find((user) => user.id === selectedUserId) ?? null,
     [selectedUserId, users]
   );
+
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  useEffect(() => {
+    inVoiceRef.current = inVoice;
+  }, [inVoice]);
+
+  useEffect(() => {
+    mutedRef.current = muted;
+  }, [muted]);
+
+  useEffect(() => {
+    signalingStateRef.current = signalingState;
+  }, [signalingState]);
 
   useEffect(() => {
     fetch("/api/ice")
@@ -109,7 +152,11 @@ function App() {
     }
 
     return () => {
+      shouldReconnectRef.current = false;
+      clearHeartbeat();
+      clearReconnectTimer();
       leaveVoice();
+      uiAudioContextRef.current?.close();
       socketRef.current?.close();
     };
   }, []);
@@ -119,13 +166,15 @@ function App() {
       return;
     }
 
+    syncVoiceStatus();
     const interval = window.setInterval(() => {
       void refreshPeerMetrics();
+      syncVoiceStatus();
     }, 2000);
     void refreshPeerMetrics();
 
     return () => window.clearInterval(interval);
-  }, [inVoice]);
+  }, [inVoice, peerStatuses]);
 
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
@@ -140,14 +189,41 @@ function App() {
       return;
     }
 
+    shouldReconnectRef.current = true;
+    reconnectAttemptRef.current = 0;
+    unlockUiAudio();
+    connectSocket(false);
+  }
+
+  function connectSocket(isReconnect: boolean) {
+    const existingSocket = socketRef.current;
+    if (
+      existingSocket &&
+      (existingSocket.readyState === WebSocket.CONNECTING || existingSocket.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
+
+    clearHeartbeat();
+    clearReconnectTimer();
+    if (!isReconnect) {
+      setError(null);
+    }
+    setSignalingState(isReconnect ? "reconnecting" : "connecting");
+    setStatus(isReconnect ? "Переподключение к серверу" : "Подключение");
+
     const socket = new WebSocket(webSocketUrl());
     socketRef.current = socket;
-    setStatus("Подключение");
 
     socket.addEventListener("open", () => {
+      setSignalingState("connected");
+      setError(null);
+      setStatus("Онлайн");
+      reconnectAttemptRef.current = 0;
+      startHeartbeat();
       send("auth.join", {
         inviteToken,
-        name: name.trim()
+        name: currentUserRef.current?.name ?? name.trim()
       });
     });
 
@@ -157,12 +233,31 @@ function App() {
     });
 
     socket.addEventListener("close", () => {
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+      clearHeartbeat();
+      closePeers();
+
+      if (shouldReconnectRef.current && currentUserRef.current) {
+        setSignalingState("reconnecting");
+        setStatus("Переподключение к серверу");
+        playUiSound("reconnect");
+        if (inVoiceRef.current) {
+          setVoiceStatus("Server disconnected");
+        }
+        scheduleReconnect();
+        return;
+      }
+
+      setSignalingState("unavailable");
       setStatus("Соединение закрыто");
       setInVoice(false);
-      closePeers();
+      playUiSound("disconnect");
     });
 
     socket.addEventListener("error", () => {
+      setSignalingState("unavailable");
       setError("Ошибка WebSocket-соединения");
       setStatus("Ошибка");
     });
@@ -170,23 +265,59 @@ function App() {
 
   async function handleServerMessage(message: ServerMessage) {
     switch (message.type) {
+      case "system.pong":
+        clearHeartbeatTimeout();
+        break;
       case "auth.ok":
+        setError(null);
         setCurrentUser(message.payload.user);
+        currentUserRef.current = message.payload.user;
+        setSignalingState("connected");
         setStatus("Онлайн");
+        if (inVoiceRef.current) {
+          setVoiceStatus("Rejoining voice");
+          send("voice.join", {});
+          applyLocalMuteState(mutedRef.current);
+          if (mutedRef.current) {
+            send("voice.mute", { muted: true });
+          }
+        }
         break;
       case "auth.error":
       case "error":
+        if (message.type === "auth.error") {
+          shouldReconnectRef.current = false;
+        }
         setError(message.payload.message);
         break;
       case "users.list":
         setUsers(message.payload.users);
         break;
       case "voice.users":
-        await createOffersFor(message.payload.users);
+        await ensurePeerOffersFor(message.payload.users);
+        break;
+      case "voice.userJoined":
+        if (message.payload.user?.id !== currentUserRef.current?.id) {
+          playUiSound("userJoin");
+        }
+        await ensurePeerOfferFor(message.payload.user);
         break;
       case "voice.userLeft":
       case "user.left":
+        if (message.payload.userId !== currentUserRef.current?.id) {
+          playUiSound("userLeave");
+        }
         closePeer(message.payload.userId);
+        break;
+      case "voice.userMuted":
+        setUsers((previous) =>
+          previous.map((user) =>
+            user.id === message.payload.userId ? { ...user, muted: Boolean(message.payload.muted) } : user
+          )
+        );
+        if (message.payload.userId === currentUserRef.current?.id) {
+          setCurrentUser((user) => (user ? { ...user, muted: Boolean(message.payload.muted) } : user));
+        }
         break;
       case "webrtc.offer":
         await handleOffer(message.payload.sourceUserId, message.payload.payload);
@@ -209,6 +340,7 @@ function App() {
       setVoiceStatus("Joining voice");
       setInVoice(true);
       send("voice.join", {});
+      playUiSound("connect");
     } catch {
       setVoiceStatus("Microphone denied");
       setError("Не удалось получить доступ к микрофону");
@@ -216,9 +348,13 @@ function App() {
   }
 
   function leaveVoice() {
+    if (inVoiceRef.current) {
+      playUiSound("disconnect");
+    }
     send("voice.leave", {});
     setInVoice(false);
     setMuted(false);
+    mutedRef.current = false;
     setVoiceStatus("Not connected");
     setPeerStatuses({});
     setPeerMetrics({});
@@ -229,19 +365,54 @@ function App() {
   function toggleMute() {
     const nextMuted = !muted;
     setMuted(nextMuted);
+    mutedRef.current = nextMuted;
+    applyLocalMuteState(nextMuted);
+    send("voice.mute", { muted: nextMuted });
+    playUiSound(nextMuted ? "mute" : "unmute");
+  }
+
+  function applyLocalMuteState(nextMuted: boolean) {
     localStreamRef.current?.getAudioTracks().forEach((track) => {
       track.enabled = !nextMuted;
     });
-    send("voice.mute", { muted: nextMuted });
   }
 
-  async function createOffersFor(remoteUsers: User[]) {
+  async function ensurePeerOffersFor(remoteUsers: User[]) {
     for (const remoteUser of remoteUsers) {
-      const peer = createPeer(remoteUser.id);
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      send("webrtc.offer", offer, remoteUser.id);
+      await ensurePeerOfferFor(remoteUser);
     }
+  }
+
+  async function ensurePeerOfferFor(remoteUser: User) {
+    if (!currentUserRef.current || remoteUser.id === currentUserRef.current.id || !remoteUser.inVoice) {
+      return;
+    }
+
+    if (!shouldInitiateOffer(remoteUser.id)) {
+      return;
+    }
+
+    await createOfferFor(remoteUser.id);
+  }
+
+  async function createOfferFor(remoteUserId: string) {
+    if (!localStreamRef.current) {
+      return;
+    }
+
+    const peer = createPeer(remoteUserId);
+    if (peer.signalingState !== "stable") {
+      return;
+    }
+
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    send("webrtc.offer", offer, remoteUserId);
+  }
+
+  function shouldInitiateOffer(remoteUserId: string) {
+    const currentUserId = currentUserRef.current?.id;
+    return Boolean(currentUserId && currentUserId < remoteUserId);
   }
 
   async function handleOffer(sourceUserId: string, offer: RTCSessionDescriptionInit) {
@@ -251,7 +422,14 @@ function App() {
       setInVoice(true);
     }
 
-    const peer = createPeer(sourceUserId);
+    let peer = createPeer(sourceUserId);
+    if (peer.signalingState !== "stable") {
+      if (shouldInitiateOffer(sourceUserId)) {
+        return;
+      }
+      closePeer(sourceUserId);
+      peer = createPeer(sourceUserId);
+    }
     await peer.setRemoteDescription(new RTCSessionDescription(offer));
     const answer = await peer.createAnswer();
     await peer.setLocalDescription(answer);
@@ -301,18 +479,32 @@ function App() {
       updatePeerStatus(remoteUserId, peer);
       if (["failed", "closed"].includes(peer.connectionState)) {
         closePeer(remoteUserId);
+        void repairPeer(remoteUserId);
+        return;
+      }
+      if (peer.connectionState === "connected") {
+        clearPeerRepairTimer(remoteUserId);
+      } else {
+        schedulePeerRepair(remoteUserId);
       }
     });
 
     peer.addEventListener("iceconnectionstatechange", () => {
       updatePeerStatus(remoteUserId, peer);
+      if (peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed") {
+        clearPeerRepairTimer(remoteUserId);
+      } else if (["failed", "disconnected"].includes(peer.iceConnectionState)) {
+        schedulePeerRepair(remoteUserId);
+      }
     });
 
     peersRef.current.set(remoteUserId, peer);
+    schedulePeerRepair(remoteUserId);
     return peer;
   }
 
   function closePeer(userId: string) {
+    clearPeerRepairTimer(userId);
     peersRef.current.get(userId)?.close();
     peersRef.current.delete(userId);
 
@@ -340,6 +532,173 @@ function App() {
   function closePeers() {
     for (const userId of Array.from(peersRef.current.keys())) {
       closePeer(userId);
+    }
+  }
+
+  function schedulePeerRepair(userId: string) {
+    if (peerRepairTimersRef.current.has(userId)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      peerRepairTimersRef.current.delete(userId);
+      void repairPeer(userId);
+    }, 12000);
+    peerRepairTimersRef.current.set(userId, timer);
+  }
+
+  function clearPeerRepairTimer(userId: string) {
+    const timer = peerRepairTimersRef.current.get(userId);
+    if (timer != null) {
+      window.clearTimeout(timer);
+      peerRepairTimersRef.current.delete(userId);
+    }
+  }
+
+  async function repairPeer(userId: string) {
+    if (!inVoiceRef.current || signalingStateRef.current !== "connected") {
+      return;
+    }
+
+    const peer = peersRef.current.get(userId);
+    if (peer?.connectionState === "connected") {
+      return;
+    }
+
+    closePeer(userId);
+    if (shouldInitiateOffer(userId)) {
+      await createOfferFor(userId);
+    }
+  }
+
+  function unlockUiAudio() {
+    try {
+      const context = uiAudioContextRef.current ?? new AudioContext();
+      uiAudioContextRef.current = context;
+      void context.resume();
+    } catch {
+      // Browsers may still block audio until a user gesture; the next click will retry.
+    }
+  }
+
+  function playUiSound(sound: UiSound) {
+    try {
+      const now = Date.now();
+      if (now - lastUiSoundAtRef.current[sound] < 700) {
+        return;
+      }
+      lastUiSoundAtRef.current[sound] = now;
+
+      const context = uiAudioContextRef.current ?? new AudioContext();
+      uiAudioContextRef.current = context;
+      void context.resume();
+
+      const patterns: Record<UiSound, Array<[number, number, number]>> = {
+        connect: [
+          [420, 0, 0.08],
+          [640, 0.09, 0.12]
+        ],
+        reconnect: [
+          [360, 0, 0.07],
+          [520, 0.09, 0.07],
+          [360, 0.18, 0.07]
+        ],
+        userJoin: [
+          [500, 0, 0.06],
+          [720, 0.07, 0.09]
+        ],
+        userLeave: [
+          [650, 0, 0.06],
+          [420, 0.07, 0.09]
+        ],
+        mute: [
+          [440, 0, 0.05],
+          [260, 0.06, 0.08]
+        ],
+        unmute: [
+          [260, 0, 0.05],
+          [440, 0.06, 0.08]
+        ],
+        disconnect: [
+          [520, 0, 0.08],
+          [300, 0.09, 0.12]
+        ],
+        problem: [
+          [240, 0, 0.13],
+          [210, 0.16, 0.18]
+        ]
+      };
+
+      for (const [frequency, offset, duration] of patterns[sound]) {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const startAt = context.currentTime + offset;
+        const endAt = startAt + duration;
+
+        oscillator.type = "sine";
+        oscillator.frequency.value = frequency;
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.05, startAt + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
+        oscillator.connect(gain).connect(context.destination);
+        oscillator.start(startAt);
+        oscillator.stop(endAt + 0.02);
+      }
+    } catch {
+      // UI sounds are non-critical.
+    }
+  }
+
+  function startHeartbeat() {
+    clearHeartbeat();
+    sendHeartbeat();
+    heartbeatIntervalRef.current = window.setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+  }
+
+  function sendHeartbeat() {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    clearHeartbeatTimeout();
+    socket.send(JSON.stringify({ type: "system.ping", payload: { timestamp: Date.now() } }));
+    heartbeatTimeoutRef.current = window.setTimeout(() => {
+      setSignalingState("unavailable");
+      setStatus("Сервер недоступен");
+      if (inVoiceRef.current) {
+        setVoiceStatus("Server unavailable");
+      }
+      playUiSound("problem");
+      socket.close();
+    }, HEARTBEAT_TIMEOUT_MS);
+  }
+
+  function clearHeartbeat() {
+    if (heartbeatIntervalRef.current != null) {
+      window.clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+    clearHeartbeatTimeout();
+  }
+
+  function clearHeartbeatTimeout() {
+    if (heartbeatTimeoutRef.current != null) {
+      window.clearTimeout(heartbeatTimeoutRef.current);
+      heartbeatTimeoutRef.current = null;
+    }
+  }
+
+  function scheduleReconnect() {
+    clearReconnectTimer();
+    const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttemptRef.current, RECONNECT_DELAYS_MS.length - 1)];
+    reconnectAttemptRef.current += 1;
+    reconnectTimeoutRef.current = window.setTimeout(() => connectSocket(true), delay);
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimeoutRef.current != null) {
+      window.clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
   }
 
@@ -599,6 +958,9 @@ function App() {
   }
 
   function voiceQuality() {
+    if (signalingState === "reconnecting" || signalingState === "unavailable") {
+      return "bad";
+    }
     const ping = averagePingMs();
     const loss = outboundPacketLossRate();
     if (ping == null && loss == null) {
@@ -614,7 +976,13 @@ function App() {
   }
 
   function voiceConnectionTitle() {
-    if (voiceStatus !== "Joining voice" && voiceStatus !== "Not connected") {
+    if (signalingState === "reconnecting") {
+      return "Reconnecting to server";
+    }
+    if (signalingState === "unavailable") {
+      return "Server unavailable";
+    }
+    if (["Requesting microphone", "Loading RNNoise", "Noise filter fallback", "Microphone denied"].includes(voiceStatus)) {
       return voiceStatus;
     }
     if (connectedPeerCount() === totalPeerCount() && totalPeerCount() > 0) {
@@ -627,7 +995,13 @@ function App() {
   }
 
   function voiceConnectionSubtitle() {
-    if (["Requesting microphone", "Loading RNNoise", "Joining voice", "Noise filter fallback"].includes(voiceStatus)) {
+    if (signalingState === "reconnecting") {
+      return "Trying to restore voice session";
+    }
+    if (signalingState === "unavailable") {
+      return "Signaling connection lost";
+    }
+    if (["Requesting microphone", "Loading RNNoise", "Noise filter fallback", "Microphone denied"].includes(voiceStatus)) {
       return voiceStatus;
     }
     const ping = averagePingMs();
@@ -636,6 +1010,22 @@ function App() {
       return DEFAULT_VOICE_ROOM_NAME;
     }
     return `${connectionType()} · ${ping} ms · ${loss?.toFixed(1) ?? "0.0"}% loss`;
+  }
+
+  function syncVoiceStatus() {
+    if (!inVoice) {
+      return;
+    }
+    const total = totalPeerCount();
+    if (total === 0) {
+      setVoiceStatus("Waiting for participants");
+      return;
+    }
+    if (connectedPeerCount() === total) {
+      setVoiceStatus("Connected");
+      return;
+    }
+    setVoiceStatus("Connecting");
   }
 
   if (!currentUser) {
@@ -895,6 +1285,7 @@ function App() {
             </div>
 
             <div className="voice-detail-stats">
+              <p>Server connection: <strong>{signalingState}</strong></p>
               <p>Average ping: <strong>{averagePingMs() ?? "n/a"}{averagePingMs() != null ? " ms" : ""}</strong></p>
               <p>Last ping: <strong>{lastPingMs() ?? "n/a"}{lastPingMs() != null ? " ms" : ""}</strong></p>
               <p>Packet loss rate: <strong>{outboundPacketLossRate()?.toFixed(1) ?? "n/a"}{outboundPacketLossRate() != null ? "%" : ""}</strong></p>

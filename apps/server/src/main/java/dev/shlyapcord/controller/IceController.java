@@ -5,16 +5,14 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
+@RequiredArgsConstructor
 public class IceController {
     private final AppProperties appProperties;
-
-    public IceController(AppProperties appProperties) {
-        this.appProperties = appProperties;
-    }
 
     @GetMapping("/api/ice")
     public Map<String, Object> ice() {

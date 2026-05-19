@@ -2,6 +2,7 @@ package dev.shlyapcord.config;
 
 import dev.shlyapcord.websocket.SignalingWebSocketHandler;
 import java.util.List;
+import lombok.RequiredArgsConstructor;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.socket.config.annotation.EnableWebSocket;
@@ -11,14 +12,10 @@ import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry
 @Configuration
 @EnableWebSocket
 @EnableConfigurationProperties(AppProperties.class)
+@RequiredArgsConstructor
 public class WebSocketConfig implements WebSocketConfigurer {
     private final SignalingWebSocketHandler signalingWebSocketHandler;
     private final AppProperties appProperties;
-
-    public WebSocketConfig(SignalingWebSocketHandler signalingWebSocketHandler, AppProperties appProperties) {
-        this.signalingWebSocketHandler = signalingWebSocketHandler;
-        this.appProperties = appProperties;
-    }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
