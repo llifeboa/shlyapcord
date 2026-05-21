@@ -207,8 +207,8 @@ function App() {
   const onlineUsers = useMemo(() => users.filter((user) => user.online), [users]);
   const offlineUsers = useMemo(() => users.filter((user) => !user.online), [users]);
   const selectedUser = useMemo(
-    () => users.find((user) => user.id === selectedUserId) ?? null,
-    [selectedUserId, users]
+      () => users.find((user) => user.id === selectedUserId) ?? null,
+      [selectedUserId, users]
   );
   const voiceStageClassName = useMemo(() => {
     if (voiceUsers.length <= 1) {
@@ -251,10 +251,44 @@ function App() {
   }, [signalingState]);
 
   useEffect(() => {
+    voiceLog("Loading ICE config from /api/ice");
+
     fetch("/api/ice")
-      .then((response) => response.json())
-      .then((config: IceConfig) => setIceConfig(config))
-      .catch(() => setIceConfig({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
+        .then(async (response) => {
+          voiceLog("/api/ice response", {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText
+          });
+
+          if (!response.ok) {
+            throw new Error(`/api/ice failed with ${response.status}`);
+          }
+
+          return response.json();
+        })
+        .then((config: IceConfig) => {
+          voiceLog("/api/ice parsed config", config);
+
+          if (!config.iceServers || config.iceServers.length === 0) {
+            voiceWarn("/api/ice returned empty iceServers, using fallback STUN");
+
+            setIceConfig({
+              iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+            });
+
+            return;
+          }
+
+          setIceConfig(config);
+        })
+        .catch((exception) => {
+          voiceError("/api/ice failed, using fallback STUN", exception);
+
+          setIceConfig({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+          });
+        });
 
     void restoreSessionOrCheckInvite();
 
@@ -412,6 +446,75 @@ function App() {
     return () => window.clearInterval(interval);
   }, [inVoice, peerStatuses]);
 
+
+  function voiceLog(label: string, data?: unknown) {
+    const time = new Date().toISOString();
+    if (data === undefined) {
+      console.log(`[VOICE ${time}] ${label}`);
+      return;
+    }
+    console.log(`[VOICE ${time}] ${label}`, data);
+  }
+
+  function voiceWarn(label: string, data?: unknown) {
+    const time = new Date().toISOString();
+    if (data === undefined) {
+      console.warn(`[VOICE ${time}] ${label}`);
+      return;
+    }
+    console.warn(`[VOICE ${time}] ${label}`, data);
+  }
+
+  function voiceError(label: string, data?: unknown) {
+    const time = new Date().toISOString();
+    if (data === undefined) {
+      console.error(`[VOICE ${time}] ${label}`);
+      return;
+    }
+    console.error(`[VOICE ${time}] ${label}`, data);
+  }
+
+  function summarizeIceCandidate(candidate: RTCIceCandidateInit | RTCIceCandidate | null) {
+    if (!candidate) {
+      return null;
+    }
+
+    const raw = ((candidate as RTCIceCandidateInit).candidate ?? "").toString();
+    const parts = raw.split(" ");
+
+    return {
+      candidate: raw,
+      sdpMid: candidate.sdpMid,
+      sdpMLineIndex: candidate.sdpMLineIndex,
+      foundation: parts[0],
+      protocol: parts[2],
+      address: parts[4],
+      port: parts[5],
+      type: parts[7],
+      hasRelay: raw.includes(" typ relay"),
+      hasSrflx: raw.includes(" typ srflx"),
+      hasHost: raw.includes(" typ host")
+    };
+  }
+
+  function summarizeDescription(description: RTCSessionDescriptionInit | RTCSessionDescription | null) {
+    if (!description) {
+      return null;
+    }
+
+    const sdp = description.sdp ?? "";
+
+    return {
+      type: description.type,
+      hasAudio: sdp.includes("m=audio"),
+      candidatesInSdp: (sdp.match(/a=candidate:/g) ?? []).length,
+      hasRelayCandidate: sdp.includes(" typ relay"),
+      hasSrflxCandidate: sdp.includes(" typ srflx"),
+      hasHostCandidate: sdp.includes(" typ host"),
+      iceUfrag: sdp.match(/a=ice-ufrag:(.+)/)?.[1] ?? null
+    };
+  }
+
   async function restoreSessionOrCheckInvite() {
     try {
       const response = await apiJson<AuthResponse>("/api/auth/refresh", { method: "POST" });
@@ -437,8 +540,8 @@ function App() {
     }
 
     fetch(`/api/invites/${encodeURIComponent(inviteToken)}`)
-      .then((response) => setInviteStatus(response.ok ? "valid" : "forbidden"))
-      .catch(() => setInviteStatus("forbidden"));
+        .then((response) => setInviteStatus(response.ok ? "valid" : "forbidden"))
+        .catch(() => setInviteStatus("forbidden"));
   }
 
   async function handleAuthSubmit(event: FormEvent) {
@@ -492,8 +595,8 @@ function App() {
   async function connectSocket(isReconnect: boolean, authName?: string) {
     const existingSocket = socketRef.current;
     if (
-      existingSocket &&
-      (existingSocket.readyState === WebSocket.CONNECTING || existingSocket.readyState === WebSocket.OPEN)
+        existingSocket &&
+        (existingSocket.readyState === WebSocket.CONNECTING || existingSocket.readyState === WebSocket.OPEN)
     ) {
       return;
     }
@@ -894,12 +997,12 @@ function App() {
       avatarUpdatedAt: user.avatarUpdatedAt
     } : currentUserRef.current;
     setUsers((previous) =>
-      previous.map((item) => item.id === user.id ? {
-        ...item,
-        nickname: user.nickname,
-        status: user.status,
-        avatarUpdatedAt: user.avatarUpdatedAt
-      } : item)
+        previous.map((item) => item.id === user.id ? {
+          ...item,
+          nickname: user.nickname,
+          status: user.status,
+          avatarUpdatedAt: user.avatarUpdatedAt
+        } : item)
     );
   }
 
@@ -929,6 +1032,22 @@ function App() {
   }
 
   async function handleServerMessage(message: ServerMessage) {
+    voiceLog("WS message received", {
+      type: message.type,
+      payload:
+          message.type === "webrtc.offer" || message.type === "webrtc.answer"
+              ? {
+                sourceUserId: message.payload.sourceUserId,
+                payload: summarizeDescription(message.payload.payload)
+              }
+              : message.type === "webrtc.iceCandidate"
+                  ? {
+                    sourceUserId: message.payload.sourceUserId,
+                    payload: summarizeIceCandidate(message.payload.payload)
+                  }
+                  : message.payload
+    });
+
     switch (message.type) {
       case "system.pong":
         clearHeartbeatTimeout();
@@ -960,16 +1079,16 @@ function App() {
         break;
       case "user.updated":
         setUsers((previous) =>
-          previous.map((user) =>
-            user.id === message.payload.user.id ? { ...user, ...message.payload.user } : user
-          )
+            previous.map((user) =>
+                user.id === message.payload.user.id ? { ...user, ...message.payload.user } : user
+            )
         );
         if (message.payload.user.id === currentUserRef.current?.id) {
           const updatedName = message.payload.user.nickname;
           setCurrentUser((user) => (user ? { ...user, ...message.payload.user, nickname: updatedName } : user));
           currentUserRef.current = currentUserRef.current
-            ? { ...currentUserRef.current, ...message.payload.user, nickname: updatedName }
-            : currentUserRef.current;
+              ? { ...currentUserRef.current, ...message.payload.user, nickname: updatedName }
+              : currentUserRef.current;
           setAuthUser((user) => (user ? {
             ...user,
             nickname: updatedName,
@@ -998,9 +1117,9 @@ function App() {
         break;
       case "voice.userMuted":
         setUsers((previous) =>
-          previous.map((user) =>
-            user.id === message.payload.userId ? { ...user, muted: Boolean(message.payload.muted) } : user
-          )
+            previous.map((user) =>
+                user.id === message.payload.userId ? { ...user, muted: Boolean(message.payload.muted) } : user
+            )
         );
         if (message.payload.userId === currentUserRef.current?.id) {
           setCurrentUser((user) => (user ? { ...user, muted: Boolean(message.payload.muted) } : user));
@@ -1019,16 +1138,45 @@ function App() {
   }
 
   async function joinVoice() {
+    voiceLog("joinVoice clicked", {
+      currentUserId: currentUserRef.current?.id,
+      signalingState: signalingStateRef.current,
+      socketReadyState: socketRef.current?.readyState,
+      iceConfig,
+      existingLocalStream: Boolean(localStreamRef.current)
+    });
+
     setError(null);
+
     try {
       setVoiceStatus("Requesting microphone");
+
+      voiceLog("Requesting microphone", AUDIO_CONSTRAINTS);
       const stream = await createLocalAudioStream();
+
+      voiceLog("Microphone stream created", {
+        streamId: stream.id,
+        tracks: stream.getTracks().map((track) => ({
+          id: track.id,
+          kind: track.kind,
+          label: track.label,
+          enabled: track.enabled,
+          muted: track.muted,
+          readyState: track.readyState,
+          settings: track.getSettings()
+        }))
+      });
+
       localStreamRef.current = stream;
       setVoiceStatus("Joining voice");
       setInVoice(true);
+
+      voiceLog("Sending voice.join");
       send("voice.join", {});
+
       playUiSound("connect");
-    } catch {
+    } catch (exception) {
+      voiceError("joinVoice failed", exception);
       setVoiceStatus("Microphone denied");
       setError("Connection error");
     }
@@ -1083,17 +1231,38 @@ function App() {
   }
 
   async function createOfferFor(remoteUserId: string) {
+    voiceLog("createOfferFor called", {
+      remoteUserId,
+      localStreamExists: Boolean(localStreamRef.current)
+    });
+
     if (!localStreamRef.current) {
+      voiceWarn("createOfferFor skipped: no local stream", { remoteUserId });
       return;
     }
 
     const peer = createPeer(remoteUserId);
+
     if (peer.signalingState !== "stable") {
+      voiceWarn("createOfferFor skipped: peer signaling state is not stable", {
+        remoteUserId,
+        signalingState: peer.signalingState
+      });
       return;
     }
 
     const offer = await peer.createOffer();
+    voiceLog("Offer created", {
+      remoteUserId,
+      offer: summarizeDescription(offer)
+    });
+
     await peer.setLocalDescription(offer);
+    voiceLog("Local description set for offer", {
+      remoteUserId,
+      localDescription: summarizeDescription(peer.localDescription)
+    });
+
     send("webrtc.offer", offer, remoteUserId);
   }
 
@@ -1103,90 +1272,300 @@ function App() {
   }
 
   async function handleOffer(sourceUserId: string, offer: RTCSessionDescriptionInit) {
+    voiceLog("handleOffer called", {
+      sourceUserId,
+      offer: summarizeDescription(offer),
+      localStreamExists: Boolean(localStreamRef.current)
+    });
+
     if (!localStreamRef.current) {
+      voiceWarn("handleOffer: no local stream, creating one", { sourceUserId });
       const stream = await createLocalAudioStream();
       localStreamRef.current = stream;
       setInVoice(true);
     }
 
     let peer = createPeer(sourceUserId);
+
     if (peer.signalingState !== "stable") {
+      voiceWarn("handleOffer: peer is not stable", {
+        sourceUserId,
+        signalingState: peer.signalingState,
+        shouldInitiateOffer: shouldInitiateOffer(sourceUserId)
+      });
+
       if (shouldInitiateOffer(sourceUserId)) {
+        voiceWarn("handleOffer skipped because this client should initiate offer", { sourceUserId });
         return;
       }
+
       closePeer(sourceUserId);
       peer = createPeer(sourceUserId);
     }
+
     await peer.setRemoteDescription(new RTCSessionDescription(offer));
+    voiceLog("Remote description set from offer", {
+      sourceUserId,
+      remoteDescription: summarizeDescription(peer.remoteDescription)
+    });
+
     const answer = await peer.createAnswer();
+    voiceLog("Answer created", {
+      sourceUserId,
+      answer: summarizeDescription(answer)
+    });
+
     await peer.setLocalDescription(answer);
+    voiceLog("Local description set for answer", {
+      sourceUserId,
+      localDescription: summarizeDescription(peer.localDescription)
+    });
+
     send("webrtc.answer", answer, sourceUserId);
   }
 
   async function handleAnswer(sourceUserId: string, answer: RTCSessionDescriptionInit) {
+    voiceLog("handleAnswer called", {
+      sourceUserId,
+      answer: summarizeDescription(answer)
+    });
+
     const peer = peersRef.current.get(sourceUserId);
+
     if (!peer) {
+      voiceWarn("handleAnswer skipped: peer not found", { sourceUserId });
       return;
     }
+
+    voiceLog("Setting remote answer", {
+      sourceUserId,
+      signalingState: peer.signalingState,
+      connectionState: peer.connectionState,
+      iceConnectionState: peer.iceConnectionState
+    });
+
     await peer.setRemoteDescription(new RTCSessionDescription(answer));
+
+    voiceLog("Remote description set from answer", {
+      sourceUserId,
+      remoteDescription: summarizeDescription(peer.remoteDescription)
+    });
   }
 
   async function handleIceCandidate(sourceUserId: string, candidate: RTCIceCandidateInit) {
+    voiceLog("handleIceCandidate called", {
+      sourceUserId,
+      candidate: summarizeIceCandidate(candidate)
+    });
+
     const peer = peersRef.current.get(sourceUserId);
-    if (!peer || !candidate) {
+
+    if (!peer) {
+      voiceWarn("handleIceCandidate skipped: peer not found", {
+        sourceUserId,
+        candidate: summarizeIceCandidate(candidate)
+      });
       return;
     }
-    await peer.addIceCandidate(new RTCIceCandidate(candidate));
+
+    if (!candidate) {
+      voiceWarn("handleIceCandidate skipped: empty candidate", { sourceUserId });
+      return;
+    }
+
+    try {
+      await peer.addIceCandidate(new RTCIceCandidate(candidate));
+      voiceLog("ICE candidate added", {
+        sourceUserId,
+        candidate: summarizeIceCandidate(candidate)
+      });
+    } catch (exception) {
+      voiceError("Failed to add ICE candidate", {
+        sourceUserId,
+        candidate: summarizeIceCandidate(candidate),
+        exception
+      });
+    }
   }
 
   function createPeer(remoteUserId: string) {
     const existing = peersRef.current.get(remoteUserId);
     if (existing) {
+      voiceLog("createPeer reused existing peer", {
+        remoteUserId,
+        connectionState: existing.connectionState,
+        iceConnectionState: existing.iceConnectionState,
+        signalingState: existing.signalingState,
+        iceGatheringState: existing.iceGatheringState
+      });
+
       return existing;
     }
 
+    voiceLog("Creating RTCPeerConnection", {
+      remoteUserId,
+      currentUserId: currentUserRef.current?.id,
+      shouldInitiateOffer: shouldInitiateOffer(remoteUserId),
+      iceConfig,
+      localStreamExists: Boolean(localStreamRef.current),
+      localTracks: localStreamRef.current?.getTracks().map((track) => ({
+        id: track.id,
+        kind: track.kind,
+        label: track.label,
+        enabled: track.enabled,
+        muted: track.muted,
+        readyState: track.readyState,
+        settings: track.getSettings()
+      }))
+    });
+
     const peer = new RTCPeerConnection(iceConfig);
     updatePeerStatus(remoteUserId, peer);
+
     localStreamRef.current?.getTracks().forEach((track) => {
+      voiceLog("Adding local track to peer", {
+        remoteUserId,
+        trackId: track.id,
+        kind: track.kind,
+        label: track.label,
+        enabled: track.enabled,
+        readyState: track.readyState
+      });
+
       peer.addTrack(track, localStreamRef.current!);
     });
 
     peer.addEventListener("icecandidate", (event) => {
       if (event.candidate) {
+        voiceLog("ICE candidate gathered", {
+          remoteUserId,
+          candidate: summarizeIceCandidate(event.candidate)
+        });
+
         send("webrtc.iceCandidate", event.candidate.toJSON(), remoteUserId);
+        return;
+      }
+
+      voiceLog("ICE gathering complete / null candidate", {
+        remoteUserId,
+        iceGatheringState: peer.iceGatheringState
+      });
+    });
+
+    peer.addEventListener("icecandidateerror", (event) => {
+      voiceError("ICE candidate error", {
+        remoteUserId,
+        address: event.address,
+        port: event.port,
+        url: event.url,
+        errorCode: event.errorCode,
+        errorText: event.errorText
+      });
+    });
+
+    peer.addEventListener("icegatheringstatechange", () => {
+      voiceLog("ICE gathering state changed", {
+        remoteUserId,
+        iceGatheringState: peer.iceGatheringState
+      });
+    });
+
+    peer.addEventListener("iceconnectionstatechange", () => {
+      voiceLog("ICE connection state changed", {
+        remoteUserId,
+        iceConnectionState: peer.iceConnectionState,
+        connectionState: peer.connectionState,
+        signalingState: peer.signalingState
+      });
+
+      updatePeerStatus(remoteUserId, peer);
+
+      if (peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed") {
+        clearPeerRepairTimer(remoteUserId);
+        void logSelectedCandidatePair(remoteUserId, peer);
+      } else if (["failed", "disconnected"].includes(peer.iceConnectionState)) {
+        voiceWarn("ICE connection needs repair", {
+          remoteUserId,
+          iceConnectionState: peer.iceConnectionState
+        });
+
+        void logAllCandidatePairs(remoteUserId, peer);
+        schedulePeerRepair(remoteUserId);
       }
     });
 
-    peer.addEventListener("track", (event) => {
-      const [stream] = event.streams;
-      attachRemoteAudio(remoteUserId, stream);
-    });
-
     peer.addEventListener("connectionstatechange", () => {
+      voiceLog("Peer connection state changed", {
+        remoteUserId,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState
+      });
+
       updatePeerStatus(remoteUserId, peer);
+
       if (["failed", "closed"].includes(peer.connectionState)) {
+        voiceWarn("Peer failed/closed, repairing", {
+          remoteUserId,
+          connectionState: peer.connectionState
+        });
+
+        void logAllCandidatePairs(remoteUserId, peer);
         closePeer(remoteUserId);
         void repairPeer(remoteUserId);
         return;
       }
+
       if (peer.connectionState === "connected") {
         clearPeerRepairTimer(remoteUserId);
+        void logSelectedCandidatePair(remoteUserId, peer);
       } else {
         schedulePeerRepair(remoteUserId);
       }
     });
 
-    peer.addEventListener("iceconnectionstatechange", () => {
-      updatePeerStatus(remoteUserId, peer);
-      if (peer.iceConnectionState === "connected" || peer.iceConnectionState === "completed") {
-        clearPeerRepairTimer(remoteUserId);
-      } else if (["failed", "disconnected"].includes(peer.iceConnectionState)) {
-        schedulePeerRepair(remoteUserId);
-      }
+    peer.addEventListener("signalingstatechange", () => {
+      voiceLog("Peer signaling state changed", {
+        remoteUserId,
+        signalingState: peer.signalingState
+      });
+    });
+
+    peer.addEventListener("negotiationneeded", () => {
+      voiceLog("Peer negotiationneeded", {
+        remoteUserId,
+        signalingState: peer.signalingState
+      });
+    });
+
+    peer.addEventListener("track", (event) => {
+      const [stream] = event.streams;
+
+      voiceLog("Remote track received", {
+        remoteUserId,
+        track: {
+          id: event.track.id,
+          kind: event.track.kind,
+          label: event.track.label,
+          enabled: event.track.enabled,
+          muted: event.track.muted,
+          readyState: event.track.readyState
+        },
+        streamId: stream?.id,
+        streamTracks: stream?.getTracks().map((track) => ({
+          id: track.id,
+          kind: track.kind,
+          enabled: track.enabled,
+          readyState: track.readyState
+        }))
+      });
+
+      attachRemoteAudio(remoteUserId, stream);
     });
 
     peersRef.current.set(remoteUserId, peer);
     schedulePeerRepair(remoteUserId);
+
     return peer;
   }
 
@@ -1393,9 +1772,28 @@ function App() {
 
   function send(type: string, payload: unknown, targetUserId?: string) {
     const socket = socketRef.current;
+
+    voiceLog("WS send requested", {
+      type,
+      targetUserId,
+      socketReadyState: socket?.readyState,
+      payload:
+          type === "webrtc.offer" || type === "webrtc.answer"
+              ? summarizeDescription(payload as RTCSessionDescriptionInit)
+              : type === "webrtc.iceCandidate"
+                  ? summarizeIceCandidate(payload as RTCIceCandidateInit)
+                  : payload
+    });
+
     if (!socket || socket.readyState !== WebSocket.OPEN) {
+      voiceWarn("WS send skipped: socket is not open", {
+        type,
+        targetUserId,
+        socketReadyState: socket?.readyState
+      });
       return;
     }
+
     socket.send(JSON.stringify({ type, targetUserId, payload }));
   }
 
@@ -1552,7 +1950,7 @@ function App() {
   async function refreshPeerMetrics() {
     const entries = Array.from(peersRef.current.entries());
     const updates = await Promise.all(
-      entries.map(async ([userId, peer]) => [userId, await readPeerMetric(peer)] as const)
+        entries.map(async ([userId, peer]) => [userId, await readPeerMetric(peer)] as const)
     );
 
     setPeerMetrics((previous) => {
@@ -1562,6 +1960,121 @@ function App() {
       }
       return next;
     });
+  }
+
+  async function logSelectedCandidatePair(userId: string, peer: RTCPeerConnection) {
+    try {
+      const report = await peer.getStats();
+      let selectedPair: any;
+      let selectedPairId: string | undefined;
+
+      report.forEach((stat: any) => {
+        if (stat.type === "transport" && stat.selectedCandidatePairId) {
+          selectedPairId = stat.selectedCandidatePairId;
+        }
+
+        if (stat.type === "candidate-pair" && (stat.selected || stat.nominated) && stat.state === "succeeded") {
+          selectedPair = stat;
+        }
+      });
+
+      if (!selectedPair && selectedPairId) {
+        selectedPair = report.get(selectedPairId);
+      }
+
+      const localCandidate = selectedPair?.localCandidateId ? report.get(selectedPair.localCandidateId) as any : undefined;
+      const remoteCandidate = selectedPair?.remoteCandidateId ? report.get(selectedPair.remoteCandidateId) as any : undefined;
+
+      voiceLog("Selected ICE candidate pair", {
+        userId,
+        pair: selectedPair
+            ? {
+              id: selectedPair.id,
+              state: selectedPair.state,
+              nominated: selectedPair.nominated,
+              currentRoundTripTime: selectedPair.currentRoundTripTime,
+              availableOutgoingBitrate: selectedPair.availableOutgoingBitrate,
+              bytesSent: selectedPair.bytesSent,
+              bytesReceived: selectedPair.bytesReceived,
+              requestsSent: selectedPair.requestsSent,
+              responsesReceived: selectedPair.responsesReceived
+            }
+            : null,
+        localCandidate: localCandidate
+            ? {
+              candidateType: localCandidate.candidateType,
+              protocol: localCandidate.protocol,
+              address: localCandidate.address,
+              ip: localCandidate.ip,
+              port: localCandidate.port,
+              relayProtocol: localCandidate.relayProtocol,
+              url: localCandidate.url
+            }
+            : null,
+        remoteCandidate: remoteCandidate
+            ? {
+              candidateType: remoteCandidate.candidateType,
+              protocol: remoteCandidate.protocol,
+              address: remoteCandidate.address,
+              ip: remoteCandidate.ip,
+              port: remoteCandidate.port
+            }
+            : null
+      });
+    } catch (exception) {
+      voiceError("Failed to read selected ICE candidate pair", exception);
+    }
+  }
+
+  async function logAllCandidatePairs(userId: string, peer: RTCPeerConnection) {
+    try {
+      const report = await peer.getStats();
+      const pairs: any[] = [];
+      const candidates: Record<string, any> = {};
+
+      report.forEach((stat: any) => {
+        if (stat.type === "local-candidate" || stat.type === "remote-candidate") {
+          candidates[stat.id] = {
+            id: stat.id,
+            type: stat.type,
+            candidateType: stat.candidateType,
+            protocol: stat.protocol,
+            address: stat.address,
+            ip: stat.ip,
+            port: stat.port,
+            relayProtocol: stat.relayProtocol,
+            url: stat.url
+          };
+        }
+      });
+
+      report.forEach((stat: any) => {
+        if (stat.type === "candidate-pair") {
+          pairs.push({
+            id: stat.id,
+            state: stat.state,
+            nominated: stat.nominated,
+            selected: stat.selected,
+            currentRoundTripTime: stat.currentRoundTripTime,
+            requestsSent: stat.requestsSent,
+            responsesReceived: stat.responsesReceived,
+            requestsReceived: stat.requestsReceived,
+            responsesSent: stat.responsesSent,
+            bytesSent: stat.bytesSent,
+            bytesReceived: stat.bytesReceived,
+            localCandidate: candidates[stat.localCandidateId],
+            remoteCandidate: candidates[stat.remoteCandidateId]
+          });
+        }
+      });
+
+      voiceLog("All ICE candidate pairs", {
+        userId,
+        pairs
+      });
+    } catch (exception) {
+      voiceError("Failed to read all ICE candidate pairs", exception);
+    }
   }
 
   async function readPeerMetric(peer: RTCPeerConnection): Promise<PeerMetric> {
@@ -1599,8 +2112,8 @@ function App() {
 
   function averagePingMs() {
     const values = Object.values(peerMetrics)
-      .map((metric) => metric.rttMs)
-      .filter((value): value is number => typeof value === "number");
+        .map((metric) => metric.rttMs)
+        .filter((value): value is number => typeof value === "number");
     if (values.length === 0) {
       return undefined;
     }
@@ -1609,19 +2122,19 @@ function App() {
 
   function lastPingMs() {
     const values = Object.values(peerMetrics)
-      .map((metric) => metric.rttMs)
-      .filter((value): value is number => typeof value === "number");
+        .map((metric) => metric.rttMs)
+        .filter((value): value is number => typeof value === "number");
     return values[values.length - 1];
   }
 
   function outboundPacketLossRate() {
     const totals = Object.values(peerMetrics).reduce(
-      (acc, metric) => {
-        acc.lost += Math.max(0, metric.packetsLost ?? 0);
-        acc.received += Math.max(0, metric.packetsReceived ?? 0);
-        return acc;
-      },
-      { lost: 0, received: 0 }
+        (acc, metric) => {
+          acc.lost += Math.max(0, metric.packetsLost ?? 0);
+          acc.received += Math.max(0, metric.packetsReceived ?? 0);
+          return acc;
+        },
+        { lost: 0, received: 0 }
     );
     const total = totals.lost + totals.received;
     if (total === 0) {
@@ -1721,498 +2234,498 @@ function App() {
   if (!currentUser) {
     if (inviteStatus === "checking") {
       return (
-        <main className="shell login-shell">
-          <section className="forbidden-panel">
-            <p className="eyebrow">Shlyapcord</p>
-            <h1>Checking invite</h1>
-          </section>
-        </main>
+          <main className="shell login-shell">
+            <section className="forbidden-panel">
+              <p className="eyebrow">Shlyapcord</p>
+              <h1>Checking invite</h1>
+            </section>
+          </main>
       );
     }
 
     if (inviteStatus === "forbidden") {
       return (
-        <main className="shell login-shell">
-          <section className="forbidden-panel">
-            <p className="eyebrow">Shlyapcord</p>
-            <h1>403 Forbidden</h1>
-          </section>
-        </main>
+          <main className="shell login-shell">
+            <section className="forbidden-panel">
+              <p className="eyebrow">Shlyapcord</p>
+              <h1>403 Forbidden</h1>
+            </section>
+          </main>
       );
     }
 
     return (
-      <main className="shell login-shell">
-        <section className="login-panel">
-          <div>
-            <p className="eyebrow">Shlyapcord</p>
-            <h1>Join Shlyapcord voice</h1>
-            <p className="muted">Invite: <span>{inviteToken || "missing"}</span></p>
-          </div>
+        <main className="shell login-shell">
+          <section className="login-panel">
+            <div>
+              <p className="eyebrow">Shlyapcord</p>
+              <h1>Join Shlyapcord voice</h1>
+              <p className="muted">Invite: <span>{inviteToken || "missing"}</span></p>
+            </div>
 
-          <form onSubmit={handleAuthSubmit}>
-            <label>
-              Login
-              <input autoComplete="username" maxLength={50} onChange={(event) => setLogin(event.target.value)} value={login} />
-            </label>
-
-            {authMode === "register" && (
+            <form onSubmit={handleAuthSubmit}>
               <label>
-                Nickname
-                <input maxLength={50} onChange={(event) => setNickname(event.target.value)} value={nickname} />
+                Login
+                <input autoComplete="username" maxLength={50} onChange={(event) => setLogin(event.target.value)} value={login} />
               </label>
-            )}
 
-            <label>
-              Password
-              <input
-                autoComplete={authMode === "login" ? "current-password" : "new-password"}
-                maxLength={128}
-                minLength={6}
-                onChange={(event) => setPassword(event.target.value)}
-                type="password"
-                value={password}
-              />
-            </label>
+              {authMode === "register" && (
+                  <label>
+                    Nickname
+                    <input maxLength={50} onChange={(event) => setNickname(event.target.value)} value={nickname} />
+                  </label>
+              )}
 
-            {authMode === "register" && (
               <label>
-                Repeat password
+                Password
                 <input
-                  autoComplete="new-password"
-                  maxLength={128}
-                  minLength={6}
-                  onChange={(event) => setPasswordRepeat(event.target.value)}
-                  type="password"
-                  value={passwordRepeat}
+                    autoComplete={authMode === "login" ? "current-password" : "new-password"}
+                    maxLength={128}
+                    minLength={6}
+                    onChange={(event) => setPassword(event.target.value)}
+                    type="password"
+                    value={password}
                 />
               </label>
-            )}
 
-            <button type="submit">{authMode === "register" ? "Create account" : "Sign in"}</button>
-          </form>
+              {authMode === "register" && (
+                  <label>
+                    Repeat password
+                    <input
+                        autoComplete="new-password"
+                        maxLength={128}
+                        minLength={6}
+                        onChange={(event) => setPasswordRepeat(event.target.value)}
+                        type="password"
+                        value={passwordRepeat}
+                    />
+                  </label>
+              )}
 
-          <button
-            className="auth-mode-button"
-            onClick={() => {
-              setAuthMode(authMode === "register" ? "login" : "register");
-              setError(null);
-            }}
-          >
-            {authMode === "register" ? "Already have an account" : "Create account"}
-          </button>
+              <button type="submit">{authMode === "register" ? "Create account" : "Sign in"}</button>
+            </form>
 
-          <StatusLine status={status} error={error} />
-        </section>
-      </main>
+            <button
+                className="auth-mode-button"
+                onClick={() => {
+                  setAuthMode(authMode === "register" ? "login" : "register");
+                  setError(null);
+                }}
+            >
+              {authMode === "register" ? "Already have an account" : "Create account"}
+            </button>
+
+            <StatusLine status={status} error={error} />
+          </section>
+        </main>
     );
   }
 
   return (
-    <main className="shell app-shell">
-      <aside className="channel-sidebar">
-        <section className="channel-group">
-          <div className="channel-title">Voice channels</div>
-          <button className={inVoice ? "channel-row active" : "channel-row"} onClick={inVoice ? undefined : joinVoice}>
-            <Users size={17} />
-            {DEFAULT_VOICE_ROOM_NAME}
-            <span>{voiceUsers.length}</span>
-          </button>
-          <div className="channel-voice-users">
-            {voiceUsers.map((user) => (
-              <button className="channel-voice-user" key={user.id} onClick={() => setSelectedUserId(user.id)}>
-                <UserAvatarView className="channel-voice-avatar" user={user} />
-                <span>{user.nickname}</span>
-                {user.muted && <MicOff size={14} />}
-              </button>
-            ))}
-          </div>
-        </section>
+      <main className="shell app-shell">
+        <aside className="channel-sidebar">
+          <section className="channel-group">
+            <div className="channel-title">Voice channels</div>
+            <button className={inVoice ? "channel-row active" : "channel-row"} onClick={inVoice ? undefined : joinVoice}>
+              <Users size={17} />
+              {DEFAULT_VOICE_ROOM_NAME}
+              <span>{voiceUsers.length}</span>
+            </button>
+            <div className="channel-voice-users">
+              {voiceUsers.map((user) => (
+                  <button className="channel-voice-user" key={user.id} onClick={() => setSelectedUserId(user.id)}>
+                    <UserAvatarView className="channel-voice-avatar" user={user} />
+                    <span>{user.nickname}</span>
+                    {user.muted && <MicOff size={14} />}
+                  </button>
+              ))}
+            </div>
+          </section>
 
-        <div className="sidebar-bottom">
-          {inVoice && (
-            <button className={`voice-connection-card quality-${voiceQuality()}`} onClick={() => setVoiceDetailsOpen(true)}>
-              <div>
-                <div className="voice-connection-title">{voiceConnectionTitle()}</div>
-                <div className="voice-connection-room">{voiceConnectionSubtitle()}</div>
-              </div>
-              <div className="voice-connection-actions">
+          <div className="sidebar-bottom">
+            {inVoice && (
+                <button className={`voice-connection-card quality-${voiceQuality()}`} onClick={() => setVoiceDetailsOpen(true)}>
+                  <div>
+                    <div className="voice-connection-title">{voiceConnectionTitle()}</div>
+                    <div className="voice-connection-room">{voiceConnectionSubtitle()}</div>
+                  </div>
+                  <div className="voice-connection-actions">
                 <span className="voice-connection-action" title="Voice details">
                   <Monitor size={15} />
                 </span>
-                <span className="voice-connection-action danger" onClick={(event) => {
-                  event.stopPropagation();
-                  leaveVoice();
-                }} title="Leave voice">
+                    <span className="voice-connection-action danger" onClick={(event) => {
+                      event.stopPropagation();
+                      leaveVoice();
+                    }} title="Leave voice">
                   <PhoneOff size={15} />
                 </span>
-              </div>
-            </button>
-          )}
-
-          <div className="user-control-bar">
-            <div className="user-mini">
-              <UserAvatarView className="user-mini-avatar" user={currentUser} />
-              <div>
-                <strong>{currentUser.nickname}</strong>
-                <span>{currentUser.status || "Online"}</span>
-              </div>
-            </div>
-            <div className="user-control-actions">
-              <button className="icon-button" onClick={toggleMute} disabled={!inVoice} title={muted ? "Unmute" : "Mute"}>
-                {muted ? <MicOff size={18} /> : <Mic size={18} />}
-              </button>
-              <button className="icon-button" disabled title="Headphones">
-                <Headphones size={18} />
-              </button>
-              <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
-                <Settings size={18} />
-              </button>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <section className="content">
-        <div className={voiceStageClassName}>
-          {voiceUsers.map((user) => (
-            <article className="voice-tile" key={user.id}>
-              <UserAvatarView className="voice-avatar" user={user} />
-              <h3>{user.nickname}</h3>
-            </article>
-          ))}
-        </div>
-
-        <footer className="voice-footer">
-          <span>{voiceUsers.length} in voice</span>
-          <span>Shlyapcord v{__APP_VERSION__}</span>
-        </footer>
-      </section>
-
-      <aside className="member-sidebar">
-        <div className="member-heading">Online - {onlineUsers.length}</div>
-        <div className="member-list">
-          {onlineUsers.map((user) => (
-            <article
-              className={user.inVoice ? "user-card in-voice clickable" : "user-card"}
-              key={user.id}
-              onClick={user.inVoice ? () => setSelectedUserId(user.id) : undefined}
-            >
-              <UserAvatarView className="avatar" user={user} />
-              <div>
-                <h3>{user.nickname}</h3>
-                <p>{user.status || "Online"}</p>
-              </div>
-              <div className="user-icons">
-                {user.inVoice && <Volume2 size={17} />}
-                {user.muted && <MicOff size={17} />}
-              </div>
-            </article>
-          ))}
-        </div>
-        <div className="member-heading offline-heading">Offline - {offlineUsers.length}</div>
-        <div className="member-list">
-          {offlineUsers.map((user) => (
-            <article className="user-card offline" key={user.id}>
-              <UserAvatarView className="avatar" user={user} />
-              <div>
-                <h3>{user.nickname}</h3>
-              </div>
-            </article>
-          ))}
-        </div>
-      </aside>
-
-      {selectedUser && (
-        <div className="modal-backdrop" onClick={() => setSelectedUserId(null)}>
-          <section className="user-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-user-header">
-              <UserAvatarView className="voice-avatar" user={selectedUser} />
-              <div>
-                <h3>{selectedUser.nickname}</h3>
-                <p>{selectedUser.status || (selectedUser.muted ? "Muted" : "In voice")}</p>
-                {selectedUser.id !== currentUser.id && (
-                  <p>
-                    Connection: {peerStatuses[selectedUser.id]?.connectionState ?? "not connected"} · ICE:{" "}
-                    {peerStatuses[selectedUser.id]?.iceConnectionState ?? "new"}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {selectedUser.id !== currentUser.id ? (
-              <SettingsSlider
-                ariaLabel={`Volume for ${selectedUser.nickname}`}
-                className="modal-volume-control"
-                label="Volume"
-                max={1000}
-                min={0}
-                onChange={(value) => changeUserVolume(selectedUser.id, value)}
-                step={5}
-                value={userVolumes[selectedUser.id] ?? 100}
-              />
-            ) : (
-              <p className="modal-note">This is you.</p>
+                  </div>
+                </button>
             )}
 
-            <button className="modal-close" onClick={() => setSelectedUserId(null)}>Close</button>
-          </section>
-        </div>
-      )}
-
-      {settingsOpen && (
-        <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
-          <section className="settings-modal" onClick={(event) => event.stopPropagation()}>
-            <nav className="settings-tabs" aria-label="Settings sections">
-              <button className={settingsTab === "profile" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("profile")} title="Profile">
-                <UserRound size={22} />
-              </button>
-              <button className={settingsTab === "voice" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("voice")} title="Voice">
-                <Mic size={22} />
-              </button>
-              <button className={settingsTab === "sound" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("sound")} title="Sound">
-                <Volume2 size={22} />
-              </button>
-            </nav>
-
-            <div className="settings-panel">
-              <button className="settings-x" onClick={() => setSettingsOpen(false)} title="Close">x</button>
-
-              {settingsTab === "profile" && currentUser && (
-                <section className="settings-section profile-section">
-                  <h3>Profile</h3>
-                  <div className="profile-layout">
-                    <div className="profile-fields">
-                      <label className="settings-field profile-edit-field">
-                        <span>Nickname <button className="inline-icon-button" onClick={() => startProfileEdit("nickname")} title="Edit nickname"><Pencil size={13} /></button></span>
-                        <input
-                          disabled={editingProfileField !== "nickname"}
-                          maxLength={50}
-                          onBlur={editingProfileField === "nickname" ? cancelProfileEdit : undefined}
-                          onChange={(event) => setProfileNickname(event.target.value)}
-                          onKeyDown={(event) => void saveProfileOnEnter(event, "nickname")}
-                          value={profileNickname}
-                        />
-                      </label>
-
-                      <label className="settings-field profile-edit-field">
-                        <span>Status <button className="inline-icon-button" onClick={() => startProfileEdit("status")} title="Edit status"><Pencil size={13} /></button></span>
-                        <input
-                          disabled={editingProfileField !== "status"}
-                          maxLength={50}
-                          onBlur={editingProfileField === "status" ? cancelProfileEdit : undefined}
-                          onChange={(event) => setProfileStatus(event.target.value)}
-                          onKeyDown={(event) => void saveProfileOnEnter(event, "status")}
-                          value={profileStatus}
-                        />
-                      </label>
-                    </div>
-
-                    <div className="profile-avatar-wrap">
-                      <UserAvatarView className="profile-avatar" user={currentUser} />
-                      <div className="profile-avatar-actions">
-                        <label className="profile-avatar-action" title="Edit avatar">
-                          <Pencil size={18} />
-                          <input
-                            accept="image/jpeg,image/png,image/webp,image/gif"
-                            disabled={avatarSaving}
-                            onChange={(event) => {
-                              openAvatarCrop(event.target.files?.[0] ?? null);
-                              event.target.value = "";
-                            }}
-                            type="file"
-                          />
-                        </label>
-                        <button className="profile-avatar-action" disabled={avatarSaving} onClick={deleteAvatar} title="Delete avatar">
-                          <Trash2 size={18} />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  <button className="settings-secondary-button danger-action settings-logout-button" onClick={() => setLogoutConfirmOpen(true)}>
-                    Log out
-                  </button>
-                </section>
-              )}
-
-              {settingsTab === "voice" && (
-                <section className="settings-section">
-                  <h3>Voice</h3>
-                  <label className="settings-field compact-settings-field">
-                    <span>Noise filter</span>
-                    <select
-                      disabled={inVoice}
-                      onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
-                      value={noiseMode}
-                    >
-                      <option value="rnnoise">RNNoise</option>
-                      <option value="browser">Browser audio</option>
-                    </select>
-                  </label>
-                  {inVoice && <p className="modal-note">Change the filter before joining voice.</p>}
-                </section>
-              )}
-
-              {settingsTab === "sound" && (
-                <section className="settings-section">
-                  <h3>Sound</h3>
-                  <SettingsSlider
-                    ariaLabel="UI sound volume"
-                    className="sound-settings-field"
-                    label="UI"
-                    max={400}
-                    min={0}
-                    onChange={setUiSoundVolume}
-                    step={10}
-                    value={uiSoundVolume}
-                  />
-                </section>
-              )}
-            </div>
-          </section>
-        </div>
-      )}
-
-      {avatarDraft && (
-        <div className="modal-backdrop" onClick={closeAvatarCrop}>
-          <section className="avatar-crop-modal" onClick={(event) => event.stopPropagation()}>
-            <div>
-              <h3>Avatar</h3>
-              <p>Choose visible area</p>
-            </div>
-
-            <div
-              className="avatar-crop-frame"
-              onPointerDown={(event) => {
-                avatarDragRef.current = { x: event.clientX, y: event.clientY };
-                event.currentTarget.setPointerCapture(event.pointerId);
-              }}
-              onPointerMove={(event) => {
-                const lastPoint = avatarDragRef.current;
-                if (!lastPoint) {
-                  return;
-                }
-                moveAvatarCrop(event.clientX - lastPoint.x, event.clientY - lastPoint.y);
-                avatarDragRef.current = { x: event.clientX, y: event.clientY };
-              }}
-              onPointerUp={() => {
-                avatarDragRef.current = null;
-              }}
-            >
-              {avatarPreviewMode === "image" ? (
-                <img
-                  alt=""
-                  draggable={false}
-                  onLoad={(event) => updateAvatarNaturalSize(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
-                  src={avatarDraft.url}
-                  style={avatarPreviewStyle(avatarDraft, avatarCropZoom, avatarCropOffset)}
-                />
-              ) : (
-                <canvas
-                  aria-label="Avatar preview"
-                  height={AVATAR_PREVIEW_SIZE}
-                  ref={avatarCanvasRef}
-                  width={AVATAR_PREVIEW_SIZE}
-                />
-              )}
-            </div>
-
-            <label className="settings-field">
-              <span>Zoom</span>
-              <input
-                max={3}
-                min={1}
-                onChange={(event) => setClampedAvatarZoom(Number(event.target.value))}
-                step={0.01}
-                type="range"
-                value={avatarCropZoom}
-              />
-            </label>
-
-            <div className="avatar-crop-actions">
-              <button className="settings-secondary-button" disabled={avatarSaving} onClick={closeAvatarCrop}>
-                Cancel
-              </button>
-              <button className="settings-secondary-button" disabled={avatarSaving} onClick={confirmAvatarCrop}>
-                {avatarSaving ? "Saving" : "Save avatar"}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {logoutConfirmOpen && (
-        <div className="modal-backdrop" onClick={() => setLogoutConfirmOpen(false)}>
-          <section className="confirm-modal" onClick={(event) => event.stopPropagation()}>
-            <div>
-              <h3>Sign out</h3>
-              <p>You will leave voice and need to sign in again.</p>
-            </div>
-
-            <div className="confirm-actions">
-              <button className="settings-secondary-button" onClick={() => setLogoutConfirmOpen(false)}>
-                Cancel
-              </button>
-              <button className="settings-secondary-button danger-action" onClick={handleLogout}>
-                Sign out
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {voiceDetailsOpen && (
-        <div className="modal-backdrop" onClick={() => setVoiceDetailsOpen(false)}>
-          <section className="voice-details-modal" onClick={(event) => event.stopPropagation()}>
-            <div>
-              <h3>Voice Details</h3>
-              <div className="voice-details-tabs">
-                <span>Connection</span>
-                <span>Privacy</span>
+            <div className="user-control-bar">
+              <div className="user-mini">
+                <UserAvatarView className="user-mini-avatar" user={currentUser} />
+                <div>
+                  <strong>{currentUser.nickname}</strong>
+                  <span>{currentUser.status || "Online"}</span>
+                </div>
+              </div>
+              <div className="user-control-actions">
+                <button className="icon-button" onClick={toggleMute} disabled={!inVoice} title={muted ? "Unmute" : "Mute"}>
+                  {muted ? <MicOff size={18} /> : <Mic size={18} />}
+                </button>
+                <button className="icon-button" disabled title="Headphones">
+                  <Headphones size={18} />
+                </button>
+                <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+                  <Settings size={18} />
+                </button>
               </div>
             </div>
+          </div>
+        </aside>
 
-            <div className="voice-detail-stats">
-              <p>Server connection: <strong>{signalingState}</strong></p>
-              <p>Average ping: <strong>{averagePingMs() ?? "n/a"}{averagePingMs() != null ? " ms" : ""}</strong></p>
-              <p>Last ping: <strong>{lastPingMs() ?? "n/a"}{lastPingMs() != null ? " ms" : ""}</strong></p>
-              <p>Packet loss rate: <strong>{outboundPacketLossRate()?.toFixed(1) ?? "n/a"}{outboundPacketLossRate() != null ? "%" : ""}</strong></p>
-              <p>Connection type: <strong>{connectionType()}</strong></p>
-              <p>Connections: <strong>{connectedPeerCount()}/{totalPeerCount()}</strong></p>
-              <p>Noise filter: <strong>{noiseStatus}</strong></p>
+        <section className="content">
+          <div className={voiceStageClassName}>
+            {voiceUsers.map((user) => (
+                <article className="voice-tile" key={user.id}>
+                  <UserAvatarView className="voice-avatar" user={user} />
+                  <h3>{user.nickname}</h3>
+                </article>
+            ))}
+          </div>
+
+          <footer className="voice-footer">
+            <span>{voiceUsers.length} in voice</span>
+            <span>Shlyapcord v{__APP_VERSION__}</span>
+          </footer>
+        </section>
+
+        <aside className="member-sidebar">
+          <div className="member-heading">Online - {onlineUsers.length}</div>
+          <div className="member-list">
+            {onlineUsers.map((user) => (
+                <article
+                    className={user.inVoice ? "user-card in-voice clickable" : "user-card"}
+                    key={user.id}
+                    onClick={user.inVoice ? () => setSelectedUserId(user.id) : undefined}
+                >
+                  <UserAvatarView className="avatar" user={user} />
+                  <div>
+                    <h3>{user.nickname}</h3>
+                    <p>{user.status || "Online"}</p>
+                  </div>
+                  <div className="user-icons">
+                    {user.inVoice && <Volume2 size={17} />}
+                    {user.muted && <MicOff size={17} />}
+                  </div>
+                </article>
+            ))}
+          </div>
+          <div className="member-heading offline-heading">Offline - {offlineUsers.length}</div>
+          <div className="member-list">
+            {offlineUsers.map((user) => (
+                <article className="user-card offline" key={user.id}>
+                  <UserAvatarView className="avatar" user={user} />
+                  <div>
+                    <h3>{user.nickname}</h3>
+                  </div>
+                </article>
+            ))}
+          </div>
+        </aside>
+
+        {selectedUser && (
+            <div className="modal-backdrop" onClick={() => setSelectedUserId(null)}>
+              <section className="user-modal" onClick={(event) => event.stopPropagation()}>
+                <div className="modal-user-header">
+                  <UserAvatarView className="voice-avatar" user={selectedUser} />
+                  <div>
+                    <h3>{selectedUser.nickname}</h3>
+                    <p>{selectedUser.status || (selectedUser.muted ? "Muted" : "In voice")}</p>
+                    {selectedUser.id !== currentUser.id && (
+                        <p>
+                          Connection: {peerStatuses[selectedUser.id]?.connectionState ?? "not connected"} · ICE:{" "}
+                          {peerStatuses[selectedUser.id]?.iceConnectionState ?? "new"}
+                        </p>
+                    )}
+                  </div>
+                </div>
+
+                {selectedUser.id !== currentUser.id ? (
+                    <SettingsSlider
+                        ariaLabel={`Volume for ${selectedUser.nickname}`}
+                        className="modal-volume-control"
+                        label="Volume"
+                        max={1000}
+                        min={0}
+                        onChange={(value) => changeUserVolume(selectedUser.id, value)}
+                        step={5}
+                        value={userVolumes[selectedUser.id] ?? 100}
+                    />
+                ) : (
+                    <p className="modal-note">This is you.</p>
+                )}
+
+                <button className="modal-close" onClick={() => setSelectedUserId(null)}>Close</button>
+              </section>
             </div>
+        )}
 
-            <p className="voice-detail-help">
-              If voice is delayed, robotic, or users cannot hear each other, check participant connection states in the user modal.
-            </p>
+        {settingsOpen && (
+            <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
+              <section className="settings-modal" onClick={(event) => event.stopPropagation()}>
+                <nav className="settings-tabs" aria-label="Settings sections">
+                  <button className={settingsTab === "profile" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("profile")} title="Profile">
+                    <UserRound size={22} />
+                  </button>
+                  <button className={settingsTab === "voice" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("voice")} title="Voice">
+                    <Mic size={22} />
+                  </button>
+                  <button className={settingsTab === "sound" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("sound")} title="Sound">
+                    <Volume2 size={22} />
+                  </button>
+                </nav>
 
-            <div className="voice-detail-encryption">End-to-end encrypted</div>
-          </section>
-        </div>
-      )}
-    </main>
+                <div className="settings-panel">
+                  <button className="settings-x" onClick={() => setSettingsOpen(false)} title="Close">x</button>
+
+                  {settingsTab === "profile" && currentUser && (
+                      <section className="settings-section profile-section">
+                        <h3>Profile</h3>
+                        <div className="profile-layout">
+                          <div className="profile-fields">
+                            <label className="settings-field profile-edit-field">
+                              <span>Nickname <button className="inline-icon-button" onClick={() => startProfileEdit("nickname")} title="Edit nickname"><Pencil size={13} /></button></span>
+                              <input
+                                  disabled={editingProfileField !== "nickname"}
+                                  maxLength={50}
+                                  onBlur={editingProfileField === "nickname" ? cancelProfileEdit : undefined}
+                                  onChange={(event) => setProfileNickname(event.target.value)}
+                                  onKeyDown={(event) => void saveProfileOnEnter(event, "nickname")}
+                                  value={profileNickname}
+                              />
+                            </label>
+
+                            <label className="settings-field profile-edit-field">
+                              <span>Status <button className="inline-icon-button" onClick={() => startProfileEdit("status")} title="Edit status"><Pencil size={13} /></button></span>
+                              <input
+                                  disabled={editingProfileField !== "status"}
+                                  maxLength={50}
+                                  onBlur={editingProfileField === "status" ? cancelProfileEdit : undefined}
+                                  onChange={(event) => setProfileStatus(event.target.value)}
+                                  onKeyDown={(event) => void saveProfileOnEnter(event, "status")}
+                                  value={profileStatus}
+                              />
+                            </label>
+                          </div>
+
+                          <div className="profile-avatar-wrap">
+                            <UserAvatarView className="profile-avatar" user={currentUser} />
+                            <div className="profile-avatar-actions">
+                              <label className="profile-avatar-action" title="Edit avatar">
+                                <Pencil size={18} />
+                                <input
+                                    accept="image/jpeg,image/png,image/webp,image/gif"
+                                    disabled={avatarSaving}
+                                    onChange={(event) => {
+                                      openAvatarCrop(event.target.files?.[0] ?? null);
+                                      event.target.value = "";
+                                    }}
+                                    type="file"
+                                />
+                              </label>
+                              <button className="profile-avatar-action" disabled={avatarSaving} onClick={deleteAvatar} title="Delete avatar">
+                                <Trash2 size={18} />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <button className="settings-secondary-button danger-action settings-logout-button" onClick={() => setLogoutConfirmOpen(true)}>
+                          Log out
+                        </button>
+                      </section>
+                  )}
+
+                  {settingsTab === "voice" && (
+                      <section className="settings-section">
+                        <h3>Voice</h3>
+                        <label className="settings-field compact-settings-field">
+                          <span>Noise filter</span>
+                          <select
+                              disabled={inVoice}
+                              onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
+                              value={noiseMode}
+                          >
+                            <option value="rnnoise">RNNoise</option>
+                            <option value="browser">Browser audio</option>
+                          </select>
+                        </label>
+                        {inVoice && <p className="modal-note">Change the filter before joining voice.</p>}
+                      </section>
+                  )}
+
+                  {settingsTab === "sound" && (
+                      <section className="settings-section">
+                        <h3>Sound</h3>
+                        <SettingsSlider
+                            ariaLabel="UI sound volume"
+                            className="sound-settings-field"
+                            label="UI"
+                            max={400}
+                            min={0}
+                            onChange={setUiSoundVolume}
+                            step={10}
+                            value={uiSoundVolume}
+                        />
+                      </section>
+                  )}
+                </div>
+              </section>
+            </div>
+        )}
+
+        {avatarDraft && (
+            <div className="modal-backdrop" onClick={closeAvatarCrop}>
+              <section className="avatar-crop-modal" onClick={(event) => event.stopPropagation()}>
+                <div>
+                  <h3>Avatar</h3>
+                  <p>Choose visible area</p>
+                </div>
+
+                <div
+                    className="avatar-crop-frame"
+                    onPointerDown={(event) => {
+                      avatarDragRef.current = { x: event.clientX, y: event.clientY };
+                      event.currentTarget.setPointerCapture(event.pointerId);
+                    }}
+                    onPointerMove={(event) => {
+                      const lastPoint = avatarDragRef.current;
+                      if (!lastPoint) {
+                        return;
+                      }
+                      moveAvatarCrop(event.clientX - lastPoint.x, event.clientY - lastPoint.y);
+                      avatarDragRef.current = { x: event.clientX, y: event.clientY };
+                    }}
+                    onPointerUp={() => {
+                      avatarDragRef.current = null;
+                    }}
+                >
+                  {avatarPreviewMode === "image" ? (
+                      <img
+                          alt=""
+                          draggable={false}
+                          onLoad={(event) => updateAvatarNaturalSize(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
+                          src={avatarDraft.url}
+                          style={avatarPreviewStyle(avatarDraft, avatarCropZoom, avatarCropOffset)}
+                      />
+                  ) : (
+                      <canvas
+                          aria-label="Avatar preview"
+                          height={AVATAR_PREVIEW_SIZE}
+                          ref={avatarCanvasRef}
+                          width={AVATAR_PREVIEW_SIZE}
+                      />
+                  )}
+                </div>
+
+                <label className="settings-field">
+                  <span>Zoom</span>
+                  <input
+                      max={3}
+                      min={1}
+                      onChange={(event) => setClampedAvatarZoom(Number(event.target.value))}
+                      step={0.01}
+                      type="range"
+                      value={avatarCropZoom}
+                  />
+                </label>
+
+                <div className="avatar-crop-actions">
+                  <button className="settings-secondary-button" disabled={avatarSaving} onClick={closeAvatarCrop}>
+                    Cancel
+                  </button>
+                  <button className="settings-secondary-button" disabled={avatarSaving} onClick={confirmAvatarCrop}>
+                    {avatarSaving ? "Saving" : "Save avatar"}
+                  </button>
+                </div>
+              </section>
+            </div>
+        )}
+
+        {logoutConfirmOpen && (
+            <div className="modal-backdrop" onClick={() => setLogoutConfirmOpen(false)}>
+              <section className="confirm-modal" onClick={(event) => event.stopPropagation()}>
+                <div>
+                  <h3>Sign out</h3>
+                  <p>You will leave voice and need to sign in again.</p>
+                </div>
+
+                <div className="confirm-actions">
+                  <button className="settings-secondary-button" onClick={() => setLogoutConfirmOpen(false)}>
+                    Cancel
+                  </button>
+                  <button className="settings-secondary-button danger-action" onClick={handleLogout}>
+                    Sign out
+                  </button>
+                </div>
+              </section>
+            </div>
+        )}
+
+        {voiceDetailsOpen && (
+            <div className="modal-backdrop" onClick={() => setVoiceDetailsOpen(false)}>
+              <section className="voice-details-modal" onClick={(event) => event.stopPropagation()}>
+                <div>
+                  <h3>Voice Details</h3>
+                  <div className="voice-details-tabs">
+                    <span>Connection</span>
+                    <span>Privacy</span>
+                  </div>
+                </div>
+
+                <div className="voice-detail-stats">
+                  <p>Server connection: <strong>{signalingState}</strong></p>
+                  <p>Average ping: <strong>{averagePingMs() ?? "n/a"}{averagePingMs() != null ? " ms" : ""}</strong></p>
+                  <p>Last ping: <strong>{lastPingMs() ?? "n/a"}{lastPingMs() != null ? " ms" : ""}</strong></p>
+                  <p>Packet loss rate: <strong>{outboundPacketLossRate()?.toFixed(1) ?? "n/a"}{outboundPacketLossRate() != null ? "%" : ""}</strong></p>
+                  <p>Connection type: <strong>{connectionType()}</strong></p>
+                  <p>Connections: <strong>{connectedPeerCount()}/{totalPeerCount()}</strong></p>
+                  <p>Noise filter: <strong>{noiseStatus}</strong></p>
+                </div>
+
+                <p className="voice-detail-help">
+                  If voice is delayed, robotic, or users cannot hear each other, check participant connection states in the user modal.
+                </p>
+
+                <div className="voice-detail-encryption">End-to-end encrypted</div>
+              </section>
+            </div>
+        )}
+      </main>
   );
 }
 
 function StatusLine({ status, error }: { status: string; error: string | null }) {
   return (
-    <div className={error ? "status error" : "status"}>
-      <span>{error || status}</span>
-    </div>
+      <div className={error ? "status error" : "status"}>
+        <span>{error || status}</span>
+      </div>
   );
 }
 
 function SettingsSlider({
-  ariaLabel,
-  className,
-  label,
-  max,
-  min,
-  onChange,
-  step,
-  value
-}: {
+                          ariaLabel,
+                          className,
+                          label,
+                          max,
+                          min,
+                          onChange,
+                          step,
+                          value
+                        }: {
   ariaLabel: string;
   className?: string;
   label: string;
@@ -2223,29 +2736,29 @@ function SettingsSlider({
   value: number;
 }) {
   return (
-    <label className={["settings-slider", className].filter(Boolean).join(" ")}>
-      <span>{label}</span>
-      <div className="settings-slider-row">
-        <span aria-hidden="true">-</span>
-        <input
-          aria-label={ariaLabel}
-          max={max}
-          min={min}
-          onChange={(event) => onChange(Number(event.target.value))}
-          step={step}
-          type="range"
-          value={value}
-        />
-        <span aria-hidden="true">+</span>
-      </div>
-    </label>
+      <label className={["settings-slider", className].filter(Boolean).join(" ")}>
+        <span>{label}</span>
+        <div className="settings-slider-row">
+          <span aria-hidden="true">-</span>
+          <input
+              aria-label={ariaLabel}
+              max={max}
+              min={min}
+              onChange={(event) => onChange(Number(event.target.value))}
+              step={step}
+              type="range"
+              value={value}
+          />
+          <span aria-hidden="true">+</span>
+        </div>
+      </label>
   );
 }
 
 function UserAvatarView({ user, className }: { user: Pick<User, "id" | "nickname" | "avatarUpdatedAt">; className: string }) {
   const src = user.avatarUpdatedAt
-    ? `/api/users/${encodeURIComponent(user.id)}/avatar?v=${encodeURIComponent(user.avatarUpdatedAt)}`
-    : null;
+      ? `/api/users/${encodeURIComponent(user.id)}/avatar?v=${encodeURIComponent(user.avatarUpdatedAt)}`
+      : null;
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const visibleSrc = src && failedSrc !== src ? src : null;
 
@@ -2254,9 +2767,9 @@ function UserAvatarView({ user, className }: { user: Pick<User, "id" | "nickname
   }, [src]);
 
   return (
-    <div className={className}>
-      {visibleSrc ? <img alt="" onError={() => setFailedSrc(visibleSrc)} src={visibleSrc} /> : user.nickname.slice(0, 1).toUpperCase()}
-    </div>
+      <div className={className}>
+        {visibleSrc ? <img alt="" onError={() => setFailedSrc(visibleSrc)} src={visibleSrc} /> : user.nickname.slice(0, 1).toUpperCase()}
+      </div>
   );
 }
 
@@ -2290,12 +2803,12 @@ function avatarPreviewStyle(draft: AvatarDraft, zoom: number, offset: Point): Re
 }
 
 function drawAvatarPreview(
-  image: CanvasImageSource,
-  canvas: HTMLCanvasElement | null,
-  naturalWidth: number,
-  naturalHeight: number,
-  zoom: number,
-  offset: Point
+    image: CanvasImageSource,
+    canvas: HTMLCanvasElement | null,
+    naturalWidth: number,
+    naturalHeight: number,
+    zoom: number,
+    offset: Point
 ) {
   if (!canvas || naturalWidth <= 0 || naturalHeight <= 0) {
     return;
@@ -2324,14 +2837,14 @@ function avatarSourceCrop(draft: AvatarDraft, zoom: number, offset: Point): Avat
   const scale = avatarBaseScale(draft) * zoom;
   const sourceSize = AVATAR_CROP_SIZE / scale;
   const sourceX = clampNumber(
-    draft.naturalWidth / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.x) / scale,
-    0,
-    draft.naturalWidth - sourceSize
+      draft.naturalWidth / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.x) / scale,
+      0,
+      draft.naturalWidth - sourceSize
   );
   const sourceY = clampNumber(
-    draft.naturalHeight / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.y) / scale,
-    0,
-    draft.naturalHeight - sourceSize
+      draft.naturalHeight / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.y) / scale,
+      0,
+      draft.naturalHeight - sourceSize
   );
   return {
     x: Math.max(0, Math.round(sourceX)),
@@ -2440,7 +2953,7 @@ function readStoredNumber(key: string, fallback: number) {
 }
 
 createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
 );
