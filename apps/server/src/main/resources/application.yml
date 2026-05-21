@@ -1,6 +1,22 @@
 spring:
   application:
     name: shlyapcord-server
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/shlyapcord}
+    username: ${DATABASE_USERNAME:shlyapcord}
+    password: ${DATABASE_PASSWORD:shlyapcord}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  liquibase:
+    change-log: classpath:/db/changelog/db.changelog-master.yml
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
 
 server:
   port: ${SERVER_PORT:8080}
@@ -13,3 +29,14 @@ shlyapcord:
     turn-url: ${TURN_URL:}
     turn-username: ${TURN_USERNAME:}
     turn-credential: ${TURN_CREDENTIAL:}
+  auth:
+    jwt-private-key: ${JWT_PRIVATE_KEY:}
+    jwt-public-key: ${JWT_PUBLIC_KEY:}
+    refresh-hmac-secret: ${REFRESH_HMAC_SECRET:local-dev-refresh-hmac-secret-change-me}
+    refresh-cookie-secure: ${REFRESH_COOKIE_SECURE:true}
+  avatar:
+    image-magick-command: ${IMAGE_MAGICK_COMMAND:convert}
+    max-upload-bytes: ${AVATAR_MAX_UPLOAD_BYTES:10485760}
+    max-stored-bytes: ${AVATAR_MAX_STORED_BYTES:5242880}
+    size: ${AVATAR_SIZE:256}
+    timeout-seconds: ${AVATAR_PROCESS_TIMEOUT_SECONDS:15}

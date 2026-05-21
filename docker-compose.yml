@@ -1,11 +1,36 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shlyapcord}
+      POSTGRES_USER: ${POSTGRES_USER:-shlyapcord}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shlyapcord}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shlyapcord} -d ${POSTGRES_DB:-shlyapcord}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   server:
     build:
       context: ./apps/server
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       SERVER_PORT: 8080
+      DATABASE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-shlyapcord}
+      DATABASE_USERNAME: ${POSTGRES_USER:-shlyapcord}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-shlyapcord}
       INVITE_TOKENS: ${INVITE_TOKENS:-local-dev}
       CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:-}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
+      REFRESH_HMAC_SECRET: ${REFRESH_HMAC_SECRET:-local-dev-refresh-hmac-secret-change-me}
+      REFRESH_COOKIE_SECURE: ${REFRESH_COOKIE_SECURE:-false}
+      IMAGE_MAGICK_COMMAND: ${IMAGE_MAGICK_COMMAND:-convert}
       STUN_URL: ${STUN_URL:-stun:stun.l.google.com:19302}
       TURN_URL: ${TURN_URL:-}
       TURN_USERNAME: ${TURN_USERNAME:-}
@@ -45,3 +70,6 @@ services:
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
+
+volumes:
+  postgres-data:

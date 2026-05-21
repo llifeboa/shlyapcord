@@ -1,0 +1,266 @@
+databaseChangeLog:
+  - changeSet:
+      id: 001-create-users
+      author: shlyapcord
+      changes:
+        - createTable:
+            tableName: users
+            columns:
+              - column:
+                  name: id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: login
+                  type: varchar(50)
+                  constraints:
+                    nullable: false
+                    unique: true
+              - column:
+                  name: nickname
+                  type: varchar(50)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: password_hash
+                  type: text
+                  constraints:
+                    nullable: false
+              - column:
+                  name: avatar_updated_at
+                  type: timestamp with time zone
+              - column:
+                  name: created_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+              - column:
+                  name: disabled
+                  type: boolean
+                  defaultValueBoolean: false
+                  constraints:
+                    nullable: false
+
+  - changeSet:
+      id: 002-create-refresh-tokens
+      author: shlyapcord
+      changes:
+        - createTable:
+            tableName: refresh_tokens
+            columns:
+              - column:
+                  name: id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: user_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+              - column:
+                  name: session_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+              - column:
+                  name: token_hash
+                  type: text
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+              - column:
+                  name: expires_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+              - column:
+                  name: revoked_at
+                  type: timestamp with time zone
+              - column:
+                  name: user_agent
+                  type: text
+              - column:
+                  name: ip_address
+                  type: text
+        - addForeignKeyConstraint:
+            baseTableName: refresh_tokens
+            baseColumnNames: user_id
+            constraintName: fk_refresh_tokens_user_id
+            referencedTableName: users
+            referencedColumnNames: id
+            onDelete: CASCADE
+        - createIndex:
+            tableName: refresh_tokens
+            indexName: idx_refresh_tokens_user_id
+            columns:
+              - column:
+                  name: user_id
+        - createIndex:
+            tableName: refresh_tokens
+            indexName: idx_refresh_tokens_session_id
+            columns:
+              - column:
+                  name: session_id
+
+  - changeSet:
+      id: 003-create-user-avatars
+      author: shlyapcord
+      changes:
+        - createTable:
+            tableName: user_avatars
+            columns:
+              - column:
+                  name: user_id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: content_type
+                  type: text
+                  constraints:
+                    nullable: false
+              - column:
+                  name: data
+                  type: bytea
+                  constraints:
+                    nullable: false
+              - column:
+                  name: size_bytes
+                  type: integer
+                  constraints:
+                    nullable: false
+              - column:
+                  name: animated
+                  type: boolean
+                  defaultValueBoolean: false
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+        - addForeignKeyConstraint:
+            baseTableName: user_avatars
+            baseColumnNames: user_id
+            constraintName: fk_user_avatars_user_id
+            referencedTableName: users
+            referencedColumnNames: id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: 004-create-user-settings
+      author: shlyapcord
+      changes:
+        - createTable:
+            tableName: user_settings
+            columns:
+              - column:
+                  name: user_id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: ui_sound_volume
+                  type: integer
+                  defaultValueNumeric: 200
+                  constraints:
+                    nullable: false
+              - column:
+                  name: noise_mode
+                  type: text
+                  defaultValue: rnnoise
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+        - addForeignKeyConstraint:
+            baseTableName: user_settings
+            baseColumnNames: user_id
+            constraintName: fk_user_settings_user_id
+            referencedTableName: users
+            referencedColumnNames: id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: 005-create-user-voice-volumes
+      author: shlyapcord
+      changes:
+        - createTable:
+            tableName: user_voice_volumes
+            columns:
+              - column:
+                  name: owner_user_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+              - column:
+                  name: target_user_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+              - column:
+                  name: volume_percent
+                  type: integer
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamp with time zone
+                  constraints:
+                    nullable: false
+        - addPrimaryKey:
+            tableName: user_voice_volumes
+            columnNames: owner_user_id, target_user_id
+            constraintName: pk_user_voice_volumes
+        - addForeignKeyConstraint:
+            baseTableName: user_voice_volumes
+            baseColumnNames: owner_user_id
+            constraintName: fk_user_voice_volumes_owner_user_id
+            referencedTableName: users
+            referencedColumnNames: id
+            onDelete: CASCADE
+        - addForeignKeyConstraint:
+            baseTableName: user_voice_volumes
+            baseColumnNames: target_user_id
+            constraintName: fk_user_voice_volumes_target_user_id
+            referencedTableName: users
+            referencedColumnNames: id
+            onDelete: CASCADE
+
+  - changeSet:
+      id: 006-add-user-status
+      author: shlyapcord
+      changes:
+        - addColumn:
+            tableName: users
+            columns:
+              - column:
+                  name: status
+                  type: varchar(50)
+                  defaultValue: ""
+                  constraints:
+                    nullable: false

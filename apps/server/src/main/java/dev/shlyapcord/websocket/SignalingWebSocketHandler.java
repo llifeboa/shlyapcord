@@ -2,12 +2,13 @@ package dev.shlyapcord.websocket;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.shlyapcord.entity.UserAccount;
 import dev.shlyapcord.model.ClientMessage;
 import dev.shlyapcord.model.UserSession;
-import dev.shlyapcord.service.InviteService;
+import dev.shlyapcord.service.AuthException;
+import dev.shlyapcord.service.AuthService;
 import dev.shlyapcord.service.UserSessionService;
 import java.io.IOException;
-import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -22,7 +23,7 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 @RequiredArgsConstructor
 public class SignalingWebSocketHandler extends TextWebSocketHandler {
     private final ObjectMapper objectMapper;
-    private final InviteService inviteService;
+    private final AuthService authService;
     private final UserSessionService userSessionService;
     private final ConcurrentMap<String, Object> sendLocks = new ConcurrentHashMap<>();
 
@@ -34,8 +35,13 @@ public class SignalingWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        if ("auth.join".equals(clientMessage.getType())) {
-            handleAuthJoin(session, clientMessage.getPayload());
+        if ("auth.token".equals(clientMessage.getType())) {
+            handleAuthToken(session, clientMessage.getPayload());
+            return;
+        }
+
+        if ("auth.refresh".equals(clientMessage.getType())) {
+            handleAuthRefresh(session, clientMessage.getPayload());
             return;
         }
 
@@ -65,23 +71,41 @@ public class SignalingWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
-    private void handleAuthJoin(WebSocketSession session, JsonNode payload) throws IOException {
-        String inviteToken = text(payload, "inviteToken");
-        String name = text(payload, "name");
+    private void handleAuthToken(WebSocketSession session, JsonNode payload) throws IOException {
+        String accessToken = text(payload, "accessToken");
+        try {
+            UserAccount account = authService.authenticateAccessToken(accessToken);
+            UserSession user = userSessionService.createAuthenticated(account, session);
+            send(session, "auth.ok", Map.of("user", userSessionService.toPublicUser(user)));
+            sendUsersList(session);
+            broadcastExcept(user.getId(), "user.joined", Map.of("user", userSessionService.toPublicUser(user)));
+        } catch (AuthException exception) {
+            send(session, "auth.error", Map.of("message", exception.getMessage(), "reason", "auth failed"));
+            session.close(new CloseStatus(4401, "auth failed"));
+        }
+    }
 
-        if (!inviteService.isValid(inviteToken)) {
-            send(session, "auth.error", Map.of("message", "Invite link is invalid"));
+    private void handleAuthRefresh(WebSocketSession session, JsonNode payload) throws IOException {
+        UserSession current = userSessionService.findBySocketSessionId(session.getId()).orElse(null);
+        if (current == null) {
+            send(session, "auth.error", Map.of("message", "Not authenticated", "reason", "auth failed"));
+            session.close(new CloseStatus(4401, "auth failed"));
             return;
         }
-        if (name == null || name.isBlank() || name.length() > 40) {
-            send(session, "auth.error", Map.of("message", "Name must be 1-40 characters"));
-            return;
-        }
 
-        UserSession user = userSessionService.create(name.trim(), inviteToken, session);
-        send(session, "auth.ok", Map.of("user", userSessionService.toPublicUser(user)));
-        sendUsersList(session);
-        broadcastExcept(user.getId(), "user.joined", Map.of("user", userSessionService.toPublicUser(user)));
+        String accessToken = text(payload, "accessToken");
+        try {
+            UserAccount account = authService.authenticateAccessToken(accessToken);
+            if (!account.getId().toString().equals(current.getId())) {
+                send(session, "auth.error", Map.of("message", "Session user mismatch", "reason", "auth failed"));
+                session.close(new CloseStatus(4401, "auth failed"));
+                return;
+            }
+            send(session, "auth.ok", Map.of("user", userSessionService.toPublicUser(current)));
+        } catch (AuthException exception) {
+            send(session, "auth.error", Map.of("message", exception.getMessage(), "reason", "auth failed"));
+            session.close(new CloseStatus(4401, "auth failed"));
+        }
     }
 
     private void handleVoiceJoin(UserSession user) throws IOException {
@@ -130,15 +154,17 @@ public class SignalingWebSocketHandler extends TextWebSocketHandler {
     }
 
     private void sendUsersList(WebSocketSession session) throws IOException {
-        send(session, "users.list", Map.of("users", publicUsers(userSessionService.all())));
+        send(session, "users.list", Map.of("users", userSessionService.publicUsers()));
+    }
+
+    public void broadcastUserUpdated(UserAccount account) throws IOException {
+        userSessionService.updateNickname(account);
+        broadcast("user.updated", Map.of("user", userSessionService.toPublicUser(account)));
+        broadcastUsersList();
     }
 
     private void broadcastUsersList() throws IOException {
-        broadcast("users.list", Map.of("users", publicUsers(userSessionService.all())));
-    }
-
-    private Collection<Map<String, Object>> publicUsers(Collection<UserSession> users) {
-        return users.stream().map(userSessionService::toPublicUser).toList();
+        broadcast("users.list", Map.of("users", userSessionService.publicUsers()));
     }
 
     private void broadcast(String type, Object payload) throws IOException {

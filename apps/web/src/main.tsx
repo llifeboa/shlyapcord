@@ -1,6 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Headphones, Mic, MicOff, PhoneOff, Settings, Users } from "lucide-react";
+import { Headphones, Mic, MicOff, Monitor, Pencil, PhoneOff, Settings, Trash2, UserRound, Users, Volume2 } from "lucide-react";
 import { loadRnnoise, RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import rnnoiseSimdWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
@@ -9,10 +9,38 @@ import "./styles.css";
 
 type User = {
   id: string;
-  name: string;
-  joinedAt: string;
+  nickname: string;
+  status: string;
+  online: boolean;
   inVoice: boolean;
   muted: boolean;
+  avatarUpdatedAt?: string | null;
+};
+
+type AuthUser = {
+  id: string;
+  login: string;
+  nickname: string;
+  status: string;
+  avatarUpdatedAt?: string | null;
+};
+
+type AuthResponse = {
+  accessToken: string;
+  user: AuthUser;
+};
+
+type RegisterResponse = {
+  user: AuthUser;
+};
+
+type SettingsResponse = {
+  uiSoundVolume: number;
+  noiseMode: NoiseMode;
+};
+
+type VoiceVolumesResponse = {
+  volumes: Record<string, number>;
 };
 
 type ServerMessage = {
@@ -47,14 +75,46 @@ type PeerMetric = {
   remoteCandidateType?: string;
 };
 
+type AuthMode = "login" | "register";
+type SettingsTab = "profile" | "voice" | "sound";
+type AvatarDraft = {
+  file: File;
+  url: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  animatedPreview: boolean;
+};
+type Point = {
+  x: number;
+  y: number;
+};
+type AvatarCrop = {
+  x: number;
+  y: number;
+  size: number;
+};
+type BrowserImageDecoder = {
+  tracks: {
+    ready: Promise<void>;
+    selectedTrack?: {
+      frameCount?: number;
+    };
+  };
+  decode: (options?: { frameIndex?: number }) => Promise<{ image: CanvasImageSource & { duration?: number; close?: () => void } }>;
+  close: () => void;
+};
+
 const inviteToken = readInviteToken();
-const DEFAULT_VOICE_ROOM_NAME = "Голосовая комната";
+const DEFAULT_VOICE_ROOM_NAME = "Voice Room";
 const MIC_GAIN_PERCENT = 1000;
 const HEARTBEAT_INTERVAL_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = 12000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000];
 const UI_SOUND_VOLUME_STORAGE_KEY = "shlyapcord.uiSoundVolume";
 const DEFAULT_UI_SOUND_VOLUME = 200;
+const AVATAR_PREVIEW_SIZE = 280;
+const AVATAR_CROP_SIZE = 220;
+const AVATAR_OUTPUT_SIZE = 512;
 const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     echoCancellation: true,
@@ -67,10 +127,18 @@ const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
 };
 
 function App() {
+  const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [login, setLogin] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [profileNickname, setProfileNickname] = useState("");
+  const [profileStatus, setProfileStatus] = useState("");
+  const [password, setPassword] = useState("");
+  const [passwordRepeat, setPasswordRepeat] = useState("");
   const [name, setName] = useState("");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [users, setUsers] = useState<User[]>([]);
-  const [status, setStatus] = useState("Ожидание входа");
+  const [status, setStatus] = useState("Idle");
   const [error, setError] = useState<string | null>(null);
   const [inVoice, setInVoice] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -81,18 +149,29 @@ function App() {
   const [userVolumes, setUserVolumes] = useState<Record<string, number>>({});
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("profile");
+  const [editingProfileField, setEditingProfileField] = useState<"nickname" | "status" | null>(null);
   const [voiceDetailsOpen, setVoiceDetailsOpen] = useState(false);
-  const [inviteStatus, setInviteStatus] = useState<"checking" | "valid" | "forbidden">(
-    inviteToken ? "checking" : "forbidden"
-  );
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [avatarSaving, setAvatarSaving] = useState(false);
+  const [avatarDraft, setAvatarDraft] = useState<AvatarDraft | null>(null);
+  const [avatarCropZoom, setAvatarCropZoom] = useState(1);
+  const [avatarCropOffset, setAvatarCropOffset] = useState<Point>({ x: 0, y: 0 });
+  const [avatarPreviewMode, setAvatarPreviewMode] = useState<"canvas" | "image">("canvas");
+  const [inviteStatus, setInviteStatus] = useState<"checking" | "valid" | "forbidden">("checking");
   const [voiceStatus, setVoiceStatus] = useState("Not connected");
   const [signalingState, setSignalingState] = useState<SignalingState>("idle");
   const [peerStatuses, setPeerStatuses] = useState<Record<string, PeerStatus>>({});
   const [peerMetrics, setPeerMetrics] = useState<Record<string, PeerMetric>>({});
   const socketRef = useRef<WebSocket | null>(null);
+  const accessTokenRef = useRef<string | null>(null);
+  const accessTokenRefreshIntervalRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
   const heartbeatTimeoutRef = useRef<number | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const settingsSaveTimeoutRef = useRef<number | null>(null);
+  const volumeSaveTimeoutsRef = useRef<Map<string, number>>(new Map());
   const reconnectAttemptRef = useRef(0);
   const shouldReconnectRef = useRef(false);
   const currentUserRef = useRef<User | null>(null);
@@ -119,12 +198,27 @@ function App() {
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const peerRepairTimersRef = useRef<Map<string, number>>(new Map());
   const remoteAudioRefs = useRef<Map<string, RemoteAudio>>(new Map());
+  const settingsLoadedRef = useRef(false);
+  const avatarDragRef = useRef<Point | null>(null);
+  const avatarDraftRef = useRef<AvatarDraft | null>(null);
+  const avatarCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const voiceUsers = useMemo(() => users.filter((user) => user.inVoice), [users]);
+  const onlineUsers = useMemo(() => users.filter((user) => user.online), [users]);
+  const offlineUsers = useMemo(() => users.filter((user) => !user.online), [users]);
   const selectedUser = useMemo(
     () => users.find((user) => user.id === selectedUserId) ?? null,
     [selectedUserId, users]
   );
+  const voiceStageClassName = useMemo(() => {
+    if (voiceUsers.length <= 1) {
+      return "voice-stage voice-stage-one";
+    }
+    if (voiceUsers.length <= 4) {
+      return "voice-stage voice-stage-two";
+    }
+    return "voice-stage voice-stage-three";
+  }, [voiceUsers.length]);
 
   useEffect(() => {
     currentUserRef.current = currentUser;
@@ -141,7 +235,16 @@ function App() {
   useEffect(() => {
     uiSoundVolumeRef.current = uiSoundVolume;
     window.localStorage.setItem(UI_SOUND_VOLUME_STORAGE_KEY, String(uiSoundVolume));
+    if (settingsLoadedRef.current) {
+      scheduleSettingsSave();
+    }
   }, [uiSoundVolume]);
+
+  useEffect(() => {
+    if (settingsLoadedRef.current) {
+      scheduleSettingsSave();
+    }
+  }, [noiseMode]);
 
   useEffect(() => {
     signalingStateRef.current = signalingState;
@@ -153,22 +256,146 @@ function App() {
       .then((config: IceConfig) => setIceConfig(config))
       .catch(() => setIceConfig({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
 
-    if (inviteToken) {
-      fetch(`/api/invites/${encodeURIComponent(inviteToken)}`)
-        .then((response) => response.json())
-        .then((payload: { valid: boolean }) => setInviteStatus(payload.valid ? "valid" : "forbidden"))
-        .catch(() => setInviteStatus("forbidden"));
-    }
+    void restoreSessionOrCheckInvite();
 
     return () => {
       shouldReconnectRef.current = false;
       clearHeartbeat();
       clearReconnectTimer();
+      stopAccessTokenRefresh();
+      clearSettingsTimers();
       leaveVoice();
       uiAudioContextRef.current?.close();
       socketRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    avatarDraftRef.current = avatarDraft;
+  }, [avatarDraft]);
+
+  useEffect(() => {
+    return () => {
+      if (avatarDraftRef.current) {
+        URL.revokeObjectURL(avatarDraftRef.current.url);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!avatarDraft) {
+      return;
+    }
+    let cancelled = false;
+    let frameId = 0;
+    let timeoutId = 0;
+    let decoder: BrowserImageDecoder | null = null;
+    const image = new Image();
+
+    const startFallbackPreview = () => {
+      image.onload = () => {
+        if (cancelled) {
+          return;
+        }
+        updateAvatarNaturalSize(image.naturalWidth, image.naturalHeight);
+        setAvatarPreviewMode("image");
+        const render = () => {
+          if (cancelled) {
+            return;
+          }
+          drawAvatarPreview(image, avatarCanvasRef.current, image.naturalWidth, image.naturalHeight, avatarCropZoom, avatarCropOffset);
+          frameId = window.requestAnimationFrame(render);
+        };
+        render();
+      };
+      image.onerror = () => {
+        if (!cancelled) {
+          setError("Failed to read avatar image");
+        }
+      };
+      image.src = avatarDraft.url;
+    };
+
+    const startDecodedPreview = async () => {
+      const Decoder = (window as typeof window & { ImageDecoder?: new (init: { data: Blob; type: string }) => BrowserImageDecoder }).ImageDecoder;
+      if (!Decoder || !avatarDraft.file.type) {
+        startFallbackPreview();
+        return;
+      }
+      try {
+        decoder = new Decoder({ data: avatarDraft.file, type: avatarDraft.file.type });
+        await decoder.tracks.ready;
+        if (cancelled) {
+          decoder.close();
+          return;
+        }
+        const firstFrame = await decoder.decode({ frameIndex: 0 });
+        const firstImage = firstFrame.image;
+        const frameWidth = Number("displayWidth" in firstImage ? (firstImage as { displayWidth: number }).displayWidth : 0);
+        const frameHeight = Number("displayHeight" in firstImage ? (firstImage as { displayHeight: number }).displayHeight : 0);
+        firstImage.close?.();
+        if (!frameWidth || !frameHeight) {
+          decoder.close();
+          decoder = null;
+          startFallbackPreview();
+          return;
+        }
+        updateAvatarNaturalSize(frameWidth, frameHeight);
+        const frameCount = Math.max(1, decoder.tracks.selectedTrack?.frameCount ?? 1);
+        setAvatarPreviewMode(frameCount > 1 ? "canvas" : avatarDraft.animatedPreview ? "image" : "canvas");
+        if (avatarDraft.animatedPreview && frameCount <= 1) {
+          decoder.close();
+          decoder = null;
+          startFallbackPreview();
+          return;
+        }
+        let frameIndex = 0;
+        const renderFrame = async () => {
+          if (cancelled || !decoder) {
+            return;
+          }
+          try {
+            const result = await decoder.decode({ frameIndex });
+            if (cancelled) {
+              result.image.close?.();
+              return;
+            }
+            drawAvatarPreview(result.image, avatarCanvasRef.current, frameWidth, frameHeight, avatarCropZoom, avatarCropOffset);
+            const durationMs = Math.max(20, Math.round((result.image.duration ?? 100000) / 1000));
+            result.image.close?.();
+            frameIndex = frameCount > 1 ? (frameIndex + 1) % frameCount : 0;
+            timeoutId = window.setTimeout(renderFrame, durationMs);
+          } catch {
+            if (!cancelled) {
+              decoder?.close();
+              decoder = null;
+              startFallbackPreview();
+            }
+          }
+        };
+        void renderFrame();
+      } catch {
+        if (!cancelled) {
+          decoder?.close();
+          decoder = null;
+          startFallbackPreview();
+        }
+      }
+    };
+
+    void startDecodedPreview();
+
+    return () => {
+      cancelled = true;
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+      }
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+      decoder?.close();
+    };
+  }, [avatarDraft, avatarCropZoom, avatarCropOffset]);
 
   useEffect(() => {
     if (!inVoice) {
@@ -185,26 +412,84 @@ function App() {
     return () => window.clearInterval(interval);
   }, [inVoice, peerStatuses]);
 
-  async function handleLogin(event: FormEvent) {
+  async function restoreSessionOrCheckInvite() {
+    try {
+      const response = await apiJson<AuthResponse>("/api/auth/refresh", { method: "POST" });
+      accessTokenRef.current = response.accessToken;
+      setAuthUser(response.user);
+      setProfileNickname(response.user.nickname);
+      setProfileStatus(response.user.status);
+      setName(response.user.nickname);
+      setInviteStatus("valid");
+      await loadUserSettings();
+      startAccessTokenRefresh();
+      shouldReconnectRef.current = true;
+      reconnectAttemptRef.current = 0;
+      void connectSocket(false, response.user.nickname);
+      return;
+    } catch {
+      accessTokenRef.current = null;
+    }
+
+    if (!inviteToken) {
+      setInviteStatus("forbidden");
+      return;
+    }
+
+    fetch(`/api/invites/${encodeURIComponent(inviteToken)}`)
+      .then((response) => setInviteStatus(response.ok ? "valid" : "forbidden"))
+      .catch(() => setInviteStatus("forbidden"));
+  }
+
+  async function handleAuthSubmit(event: FormEvent) {
     event.preventDefault();
     setError(null);
 
     if (!inviteToken) {
-      setError("Invite token отсутствует в ссылке");
+      setError("Invite token is missing");
       return;
     }
-    if (!name.trim()) {
-      setError("Введите имя");
+    if (!login.trim()) {
+      setError("Enter login");
       return;
     }
 
-    shouldReconnectRef.current = true;
-    reconnectAttemptRef.current = 0;
-    unlockUiAudio();
-    connectSocket(false);
+    try {
+      setStatus(authMode === "register" ? "Creating account" : "Signing in");
+      if (authMode === "register") {
+        await apiJson<RegisterResponse>("/api/auth/register", {
+          method: "POST",
+          body: JSON.stringify({ inviteToken, login, nickname, password, passwordRepeat })
+        });
+        setAuthMode("login");
+        setPassword("");
+        setPasswordRepeat("");
+        setStatus("Account created. Sign in.");
+        return;
+      }
+
+      const response = await apiJson<AuthResponse>("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ inviteToken, login, password })
+      });
+      accessTokenRef.current = response.accessToken;
+      setAuthUser(response.user);
+      setName(response.user.nickname);
+      setProfileNickname(response.user.nickname);
+      setProfileStatus(response.user.status);
+      await loadUserSettings();
+      startAccessTokenRefresh();
+      shouldReconnectRef.current = true;
+      reconnectAttemptRef.current = 0;
+      unlockUiAudio();
+      void connectSocket(false, response.user.nickname);
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Auth failed");
+      setStatus("Auth failed");
+    }
   }
 
-  function connectSocket(isReconnect: boolean) {
+  async function connectSocket(isReconnect: boolean, authName?: string) {
     const existingSocket = socketRef.current;
     if (
       existingSocket &&
@@ -219,7 +504,17 @@ function App() {
       setError(null);
     }
     setSignalingState(isReconnect ? "reconnecting" : "connecting");
-    setStatus(isReconnect ? "Переподключение к серверу" : "Подключение");
+    setStatus(isReconnect ? "Reconnecting" : "Connecting");
+
+    if (isReconnect) {
+      const refreshed = await refreshAccessTokenForReconnect();
+      if (!refreshed) {
+        if (shouldReconnectRef.current) {
+          scheduleReconnect();
+        }
+        return;
+      }
+    }
 
     const socket = new WebSocket(webSocketUrl());
     socketRef.current = socket;
@@ -227,13 +522,10 @@ function App() {
     socket.addEventListener("open", () => {
       setSignalingState("connected");
       setError(null);
-      setStatus("Онлайн");
+      setStatus("Online");
       reconnectAttemptRef.current = 0;
       startHeartbeat();
-      send("auth.join", {
-        inviteToken,
-        name: currentUserRef.current?.name ?? name.trim()
-      });
+      send("auth.token", { accessToken: accessTokenRef.current });
     });
 
     socket.addEventListener("message", async (event) => {
@@ -250,7 +542,7 @@ function App() {
 
       if (shouldReconnectRef.current && currentUserRef.current) {
         setSignalingState("reconnecting");
-        setStatus("Переподключение к серверу");
+        setStatus("Online");
         playUiSound("reconnect");
         if (inVoiceRef.current) {
           setVoiceStatus("Server disconnected");
@@ -260,16 +552,380 @@ function App() {
       }
 
       setSignalingState("unavailable");
-      setStatus("Соединение закрыто");
+      setStatus("Online");
       setInVoice(false);
       playUiSound("disconnect");
     });
 
     socket.addEventListener("error", () => {
-      setSignalingState("unavailable");
-      setError("Ошибка WebSocket-соединения");
-      setStatus("Ошибка");
+      setSignalingState(shouldReconnectRef.current ? "reconnecting" : "unavailable");
+      setError("Connection error");
+      setStatus("Online");
     });
+  }
+
+  function startAccessTokenRefresh() {
+    stopAccessTokenRefresh();
+    accessTokenRefreshIntervalRef.current = window.setInterval(() => {
+      void refreshAccessToken();
+    }, 12 * 60 * 1000);
+  }
+
+  function stopAccessTokenRefresh() {
+    if (accessTokenRefreshIntervalRef.current != null) {
+      window.clearInterval(accessTokenRefreshIntervalRef.current);
+      accessTokenRefreshIntervalRef.current = null;
+    }
+  }
+
+  async function refreshAccessToken() {
+    try {
+      const response = await apiJson<AuthResponse>("/api/auth/refresh", { method: "POST" });
+      accessTokenRef.current = response.accessToken;
+      setAuthUser(response.user);
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        send("auth.refresh", { accessToken: response.accessToken });
+      }
+    } catch {
+      accessTokenRef.current = null;
+      stopAccessTokenRefresh();
+      shouldReconnectRef.current = false;
+      socketRef.current?.close();
+      setCurrentUser(null);
+      setAuthUser(null);
+      setError("Session expired");
+    }
+  }
+
+  function authedApiJson<T>(url: string, init: RequestInit = {}) {
+    return apiJson<T>(url, {
+      ...init,
+      headers: {
+        ...authHeaders(accessTokenRef.current),
+        ...(init.headers ?? {})
+      }
+    });
+  }
+
+  function authedApiForm<T>(url: string, init: RequestInit = {}) {
+    return apiForm<T>(url, {
+      ...init,
+      headers: {
+        ...authHeaders(accessTokenRef.current),
+        ...(init.headers ?? {})
+      }
+    });
+  }
+
+  async function loadUserSettings() {
+    try {
+      const [settings, voiceVolumes] = await Promise.all([
+        authedApiJson<SettingsResponse>("/api/settings"),
+        authedApiJson<VoiceVolumesResponse>("/api/settings/voice-volumes")
+      ]);
+      settingsLoadedRef.current = false;
+      setUiSoundVolume(settings.uiSoundVolume);
+      setNoiseMode(settings.noiseMode);
+      setUserVolumes(voiceVolumes.volumes ?? {});
+      window.setTimeout(() => {
+        settingsLoadedRef.current = true;
+      }, 0);
+    } catch {
+      settingsLoadedRef.current = true;
+    }
+  }
+
+  function scheduleSettingsSave() {
+    if (!accessTokenRef.current) {
+      return;
+    }
+    if (settingsSaveTimeoutRef.current != null) {
+      window.clearTimeout(settingsSaveTimeoutRef.current);
+    }
+    settingsSaveTimeoutRef.current = window.setTimeout(() => {
+      settingsSaveTimeoutRef.current = null;
+      void authedApiJson<SettingsResponse>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ uiSoundVolume, noiseMode })
+      }).catch(() => setError("Failed to save settings"));
+    }, 400);
+  }
+
+  function scheduleVoiceVolumeSave(userId: string, volume: number) {
+    if (!accessTokenRef.current) {
+      return;
+    }
+    const existing = volumeSaveTimeoutsRef.current.get(userId);
+    if (existing != null) {
+      window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+      volumeSaveTimeoutsRef.current.delete(userId);
+      void authedApiJson<VoiceVolumesResponse>(`/api/settings/voice-volumes/${encodeURIComponent(userId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ volumePercent: volume })
+      }).catch(() => setError("Failed to save volume"));
+    }, 400);
+    volumeSaveTimeoutsRef.current.set(userId, timer);
+  }
+
+  function clearSettingsTimers() {
+    if (settingsSaveTimeoutRef.current != null) {
+      window.clearTimeout(settingsSaveTimeoutRef.current);
+      settingsSaveTimeoutRef.current = null;
+    }
+    for (const timer of volumeSaveTimeoutsRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    volumeSaveTimeoutsRef.current.clear();
+  }
+
+  async function saveProfile() {
+    if (!accessTokenRef.current) {
+      return;
+    }
+    setProfileSaving(true);
+    setError(null);
+    try {
+      const user = await authedApiJson<AuthUser>("/api/me/profile", {
+        method: "PATCH",
+        body: JSON.stringify({ nickname: profileNickname, status: profileStatus })
+      });
+      applyOwnProfile(user);
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Failed to save profile");
+    } finally {
+      setProfileSaving(false);
+    }
+  }
+
+  async function refreshAccessTokenForReconnect() {
+    try {
+      const response = await fetch("/api/auth/refresh", {
+        credentials: "same-origin",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+
+      if (response.status === 401 || response.status === 403) {
+        accessTokenRef.current = null;
+        stopAccessTokenRefresh();
+        shouldReconnectRef.current = false;
+        setCurrentUser(null);
+        setAuthUser(null);
+        setError("Session expired");
+        return false;
+      }
+
+      if (!response.ok) {
+        return false;
+      }
+
+      const payload = await response.json() as AuthResponse;
+      accessTokenRef.current = payload.accessToken;
+      setAuthUser(payload.user);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function startProfileEdit(field: "nickname" | "status") {
+    setEditingProfileField(field);
+    setProfileNickname(authUser?.nickname ?? currentUser?.nickname ?? "");
+    setProfileStatus(authUser?.status ?? currentUser?.status ?? "");
+  }
+
+  function cancelProfileEdit() {
+    setProfileNickname(authUser?.nickname ?? currentUser?.nickname ?? "");
+    setProfileStatus(authUser?.status ?? currentUser?.status ?? "");
+    setEditingProfileField(null);
+  }
+
+  async function saveProfileOnEnter(event: React.KeyboardEvent<HTMLInputElement>, field: "nickname" | "status") {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      await saveProfile();
+      setEditingProfileField(null);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelProfileEdit();
+      return;
+    }
+    if (editingProfileField !== field) {
+      event.preventDefault();
+    }
+  }
+
+  async function uploadAvatar(file: File | null, crop?: AvatarCrop) {
+    if (!file || !accessTokenRef.current) {
+      return;
+    }
+    setAvatarSaving(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      if (crop) {
+        formData.append("cropX", String(crop.x));
+        formData.append("cropY", String(crop.y));
+        formData.append("cropSize", String(crop.size));
+      }
+      const user = await authedApiForm<AuthUser>("/api/me/avatar", {
+        method: "PUT",
+        body: formData
+      });
+      applyOwnProfile(user);
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Failed to upload avatar");
+    } finally {
+      setAvatarSaving(false);
+    }
+  }
+
+  function openAvatarCrop(file: File | null) {
+    if (!file) {
+      return;
+    }
+    setError(null);
+    setAvatarCropZoom(1);
+    setAvatarCropOffset({ x: 0, y: 0 });
+    const nextDraft = {
+      file,
+      url: URL.createObjectURL(file),
+      naturalWidth: 0,
+      naturalHeight: 0,
+      animatedPreview: file.type === "image/gif" || file.type === "image/webp"
+    };
+    setAvatarDraft((currentDraft) => {
+      if (currentDraft) {
+        URL.revokeObjectURL(currentDraft.url);
+      }
+      return nextDraft;
+    });
+  }
+
+  function closeAvatarCrop() {
+    setAvatarDraft((currentDraft) => {
+      if (currentDraft) {
+        URL.revokeObjectURL(currentDraft.url);
+      }
+      return null;
+    });
+    avatarDragRef.current = null;
+  }
+
+  function updateAvatarNaturalSize(width: number, height: number) {
+    setAvatarDraft((currentDraft) => currentDraft ? {
+      ...currentDraft,
+      naturalWidth: width,
+      naturalHeight: height
+    } : currentDraft);
+  }
+
+  function setClampedAvatarZoom(nextZoom: number) {
+    const zoom = Math.min(3, Math.max(1, nextZoom));
+    setAvatarCropZoom(zoom);
+    setAvatarCropOffset((offset) => clampAvatarOffset(offset, zoom, avatarDraft));
+  }
+
+  function moveAvatarCrop(deltaX: number, deltaY: number) {
+    setAvatarCropOffset((offset) => clampAvatarOffset({
+      x: offset.x + deltaX,
+      y: offset.y + deltaY
+    }, avatarCropZoom, avatarDraft));
+  }
+
+  async function confirmAvatarCrop() {
+    if (!avatarDraft || avatarDraft.naturalWidth <= 0 || avatarDraft.naturalHeight <= 0) {
+      return;
+    }
+    setAvatarSaving(true);
+    setError(null);
+    try {
+      const crop = avatarSourceCrop(avatarDraft, avatarCropZoom, avatarCropOffset);
+      closeAvatarCrop();
+      if (avatarDraft.animatedPreview) {
+        await uploadAvatar(avatarDraft.file, crop);
+      } else {
+        const croppedFile = await createCroppedAvatarFile(avatarDraft, crop);
+        await uploadAvatar(croppedFile);
+      }
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Failed to crop avatar");
+      setAvatarSaving(false);
+    }
+  }
+
+  async function deleteAvatar() {
+    if (!accessTokenRef.current) {
+      return;
+    }
+    setAvatarSaving(true);
+    setError(null);
+    try {
+      const user = await authedApiJson<AuthUser>("/api/me/avatar", { method: "DELETE" });
+      applyOwnProfile(user);
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Failed to delete avatar");
+    } finally {
+      setAvatarSaving(false);
+    }
+  }
+
+  function applyOwnProfile(user: AuthUser) {
+    setAuthUser(user);
+    setProfileNickname(user.nickname);
+    setProfileStatus(user.status);
+    setCurrentUser((current) => current ? {
+      ...current,
+      nickname: user.nickname,
+      status: user.status,
+      avatarUpdatedAt: user.avatarUpdatedAt
+    } : current);
+    currentUserRef.current = currentUserRef.current ? {
+      ...currentUserRef.current,
+      nickname: user.nickname,
+      status: user.status,
+      avatarUpdatedAt: user.avatarUpdatedAt
+    } : currentUserRef.current;
+    setUsers((previous) =>
+      previous.map((item) => item.id === user.id ? {
+        ...item,
+        nickname: user.nickname,
+        status: user.status,
+        avatarUpdatedAt: user.avatarUpdatedAt
+      } : item)
+    );
+  }
+
+  async function handleLogout() {
+    shouldReconnectRef.current = false;
+    stopAccessTokenRefresh();
+    clearSettingsTimers();
+    try {
+      await apiJson<void>("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Local logout still needs to clear client state if the server is unreachable.
+    }
+    leaveVoice();
+    socketRef.current?.close();
+    accessTokenRef.current = null;
+    setAuthUser(null);
+    setCurrentUser(null);
+    currentUserRef.current = null;
+    setUsers([]);
+    setInVoice(false);
+    setMuted(false);
+    setSettingsOpen(false);
+    setVoiceDetailsOpen(false);
+    setLogoutConfirmOpen(false);
+    setSelectedUserId(null);
+    setStatus("Signed out");
   }
 
   async function handleServerMessage(message: ServerMessage) {
@@ -282,7 +938,7 @@ function App() {
         setCurrentUser(message.payload.user);
         currentUserRef.current = message.payload.user;
         setSignalingState("connected");
-        setStatus("Онлайн");
+        setStatus("Online");
         if (inVoiceRef.current) {
           setVoiceStatus("Rejoining voice");
           send("voice.join", {});
@@ -301,6 +957,28 @@ function App() {
         break;
       case "users.list":
         setUsers(message.payload.users);
+        break;
+      case "user.updated":
+        setUsers((previous) =>
+          previous.map((user) =>
+            user.id === message.payload.user.id ? { ...user, ...message.payload.user } : user
+          )
+        );
+        if (message.payload.user.id === currentUserRef.current?.id) {
+          const updatedName = message.payload.user.nickname;
+          setCurrentUser((user) => (user ? { ...user, ...message.payload.user, nickname: updatedName } : user));
+          currentUserRef.current = currentUserRef.current
+            ? { ...currentUserRef.current, ...message.payload.user, nickname: updatedName }
+            : currentUserRef.current;
+          setAuthUser((user) => (user ? {
+            ...user,
+            nickname: updatedName,
+            status: message.payload.user.status,
+            avatarUpdatedAt: message.payload.user.avatarUpdatedAt
+          } : user));
+          setProfileNickname(updatedName);
+          setProfileStatus(message.payload.user.status ?? "");
+        }
         break;
       case "voice.users":
         await ensurePeerOffersFor(message.payload.users);
@@ -352,7 +1030,7 @@ function App() {
       playUiSound("connect");
     } catch {
       setVoiceStatus("Microphone denied");
-      setError("Не удалось получить доступ к микрофону");
+      setError("Connection error");
     }
   }
 
@@ -675,7 +1353,7 @@ function App() {
     socket.send(JSON.stringify({ type: "system.ping", payload: { timestamp: Date.now() } }));
     heartbeatTimeoutRef.current = window.setTimeout(() => {
       setSignalingState("unavailable");
-      setStatus("Сервер недоступен");
+      setStatus("Online");
       if (inVoiceRef.current) {
         setVoiceStatus("Server unavailable");
       }
@@ -703,7 +1381,7 @@ function App() {
     clearReconnectTimer();
     const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttemptRef.current, RECONNECT_DELAYS_MS.length - 1)];
     reconnectAttemptRef.current += 1;
-    reconnectTimeoutRef.current = window.setTimeout(() => connectSocket(true), delay);
+    reconnectTimeoutRef.current = window.setTimeout(() => void connectSocket(true), delay);
   }
 
   function clearReconnectTimer() {
@@ -753,6 +1431,7 @@ function App() {
   function changeUserVolume(userId: string, volume: number) {
     setUserVolumes((previous) => ({ ...previous, [userId]: volume }));
     applyRemoteVolume(userId, volume);
+    scheduleVoiceVolumeSave(userId, volume);
   }
 
   function applyRemoteVolume(userId: string, volume: number) {
@@ -867,7 +1546,7 @@ function App() {
     if (!inVoice) {
       return "Not connected";
     }
-    return `${voiceStatus} · ${connectedPeerCount()}/${totalPeerCount()} peers · ${noiseStatus}`;
+    return `${voiceStatus} - ${connectedPeerCount()}/${totalPeerCount()} peers - ${noiseStatus}`;
   }
 
   async function refreshPeerMetrics() {
@@ -1020,7 +1699,7 @@ function App() {
     if (ping == null) {
       return DEFAULT_VOICE_ROOM_NAME;
     }
-    return `${connectionType()} · ${ping} ms · ${loss?.toFixed(1) ?? "0.0"}% loss`;
+    return `${ping} ms - ${loss?.toFixed(1) ?? "0.0"}% loss`;
   }
 
   function syncVoiceStatus() {
@@ -1067,19 +1746,61 @@ function App() {
         <section className="login-panel">
           <div>
             <p className="eyebrow">Shlyapcord</p>
-            <h1>Вход в голосовую комнату</h1>
-            <p className="muted">
-              Invite: <span>{inviteToken || "не найден"}</span>
-            </p>
+            <h1>Join Shlyapcord voice</h1>
+            <p className="muted">Invite: <span>{inviteToken || "missing"}</span></p>
           </div>
 
-          <form onSubmit={handleLogin} className="login-form">
+          <form onSubmit={handleAuthSubmit}>
             <label>
-              Имя
-              <input value={name} onChange={(event) => setName(event.target.value)} maxLength={40} autoFocus />
+              Login
+              <input autoComplete="username" maxLength={50} onChange={(event) => setLogin(event.target.value)} value={login} />
             </label>
-            <button type="submit">Войти</button>
+
+            {authMode === "register" && (
+              <label>
+                Nickname
+                <input maxLength={50} onChange={(event) => setNickname(event.target.value)} value={nickname} />
+              </label>
+            )}
+
+            <label>
+              Password
+              <input
+                autoComplete={authMode === "login" ? "current-password" : "new-password"}
+                maxLength={128}
+                minLength={6}
+                onChange={(event) => setPassword(event.target.value)}
+                type="password"
+                value={password}
+              />
+            </label>
+
+            {authMode === "register" && (
+              <label>
+                Repeat password
+                <input
+                  autoComplete="new-password"
+                  maxLength={128}
+                  minLength={6}
+                  onChange={(event) => setPasswordRepeat(event.target.value)}
+                  type="password"
+                  value={passwordRepeat}
+                />
+              </label>
+            )}
+
+            <button type="submit">{authMode === "register" ? "Create account" : "Sign in"}</button>
           </form>
+
+          <button
+            className="auth-mode-button"
+            onClick={() => {
+              setAuthMode(authMode === "register" ? "login" : "register");
+              setError(null);
+            }}
+          >
+            {authMode === "register" ? "Already have an account" : "Create account"}
+          </button>
 
           <StatusLine status={status} error={error} />
         </section>
@@ -1089,18 +1810,9 @@ function App() {
 
   return (
     <main className="shell app-shell">
-      <nav className="server-rail" aria-label="Servers">
-        <div className="server-icon">S</div>
-      </nav>
-
       <aside className="channel-sidebar">
-        <div>
-          <p className="eyebrow">Shlyapcord</p>
-          <h1>{DEFAULT_VOICE_ROOM_NAME}</h1>
-        </div>
-
         <section className="channel-group">
-          <div className="channel-title">Комната по умолчанию</div>
+          <div className="channel-title">Voice channels</div>
           <button className={inVoice ? "channel-row active" : "channel-row"} onClick={inVoice ? undefined : joinVoice}>
             <Users size={17} />
             {DEFAULT_VOICE_ROOM_NAME}
@@ -1109,8 +1821,8 @@ function App() {
           <div className="channel-voice-users">
             {voiceUsers.map((user) => (
               <button className="channel-voice-user" key={user.id} onClick={() => setSelectedUserId(user.id)}>
-                <div className="channel-voice-avatar">{user.name.slice(0, 1).toUpperCase()}</div>
-                <span>{user.name}</span>
+                <UserAvatarView className="channel-voice-avatar" user={user} />
+                <span>{user.nickname}</span>
                 {user.muted && <MicOff size={14} />}
               </button>
             ))}
@@ -1124,31 +1836,36 @@ function App() {
                 <div className="voice-connection-title">{voiceConnectionTitle()}</div>
                 <div className="voice-connection-room">{voiceConnectionSubtitle()}</div>
               </div>
-              <span className="icon-button danger voice-disconnect" onClick={(event) => {
-                event.stopPropagation();
-                leaveVoice();
-              }} title="Выйти из голоса">
-                <PhoneOff size={18} />
-              </span>
+              <div className="voice-connection-actions">
+                <span className="voice-connection-action" title="Voice details">
+                  <Monitor size={15} />
+                </span>
+                <span className="voice-connection-action danger" onClick={(event) => {
+                  event.stopPropagation();
+                  leaveVoice();
+                }} title="Leave voice">
+                  <PhoneOff size={15} />
+                </span>
+              </div>
             </button>
           )}
 
           <div className="user-control-bar">
             <div className="user-mini">
-              <div className="user-mini-avatar">{currentUser.name.slice(0, 1).toUpperCase()}</div>
+              <UserAvatarView className="user-mini-avatar" user={currentUser} />
               <div>
-                <strong>{currentUser.name}</strong>
-                <span>{error || status}</span>
+                <strong>{currentUser.nickname}</strong>
+                <span>{currentUser.status || "Online"}</span>
               </div>
             </div>
             <div className="user-control-actions">
-              <button className="icon-button" onClick={toggleMute} disabled={!inVoice} title={muted ? "Включить микрофон" : "Выключить микрофон"}>
+              <button className="icon-button" onClick={toggleMute} disabled={!inVoice} title={muted ? "Unmute" : "Mute"}>
                 {muted ? <MicOff size={18} /> : <Mic size={18} />}
               </button>
-              <button className="icon-button" disabled title="Наушники">
+              <button className="icon-button" disabled title="Headphones">
                 <Headphones size={18} />
               </button>
-              <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Настройки">
+              <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
                 <Settings size={18} />
               </button>
             </div>
@@ -1157,57 +1874,49 @@ function App() {
       </aside>
 
       <section className="content">
-        <header className="content-header">
-          <div>
-            <p className="eyebrow">Голосовой канал</p>
-            <h2>{DEFAULT_VOICE_ROOM_NAME}</h2>
-          </div>
-          <div className="current-user">{currentUser.name}</div>
-        </header>
-
-        <div className="voice-stage">
-          {voiceUsers.length === 0 ? (
-            <div className="empty-voice">
-              <Mic size={28} />
-              <h3>В голосовом канале пока пусто</h3>
-            </div>
-          ) : (
-            voiceUsers.map((user) => (
-              <article className="voice-tile" key={user.id}>
-                <div className="voice-avatar">{user.name.slice(0, 1).toUpperCase()}</div>
-                <h3>{user.name}</h3>
-                <div className="voice-state">
-                  {user.muted ? <MicOff size={16} /> : <Mic size={16} />}
-                  {user.muted ? "Muted" : "Speaking ready"}
-                </div>
-              </article>
-            ))
-          )}
+        <div className={voiceStageClassName}>
+          {voiceUsers.map((user) => (
+            <article className="voice-tile" key={user.id}>
+              <UserAvatarView className="voice-avatar" user={user} />
+              <h3>{user.nickname}</h3>
+            </article>
+          ))}
         </div>
 
         <footer className="voice-footer">
-          <span>{voiceUsers.length} в голосе</span>
+          <span>{voiceUsers.length} in voice</span>
           <span>Shlyapcord v{__APP_VERSION__}</span>
         </footer>
       </section>
 
       <aside className="member-sidebar">
-        <div className="member-heading">Онлайн - {users.length}</div>
+        <div className="member-heading">Online - {onlineUsers.length}</div>
         <div className="member-list">
-          {users.map((user) => (
+          {onlineUsers.map((user) => (
             <article
               className={user.inVoice ? "user-card in-voice clickable" : "user-card"}
               key={user.id}
               onClick={user.inVoice ? () => setSelectedUserId(user.id) : undefined}
             >
-              <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
+              <UserAvatarView className="avatar" user={user} />
               <div>
-                <h3>{user.name}</h3>
-                <p>{user.inVoice ? "В голосовой комнате" : "Онлайн"}</p>
+                <h3>{user.nickname}</h3>
+                <p>{user.status || "Online"}</p>
               </div>
               <div className="user-icons">
-                {user.inVoice && <Users size={17} />}
+                {user.inVoice && <Volume2 size={17} />}
                 {user.muted && <MicOff size={17} />}
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="member-heading offline-heading">Offline - {offlineUsers.length}</div>
+        <div className="member-list">
+          {offlineUsers.map((user) => (
+            <article className="user-card offline" key={user.id}>
+              <UserAvatarView className="avatar" user={user} />
+              <div>
+                <h3>{user.nickname}</h3>
               </div>
             </article>
           ))}
@@ -1218,10 +1927,10 @@ function App() {
         <div className="modal-backdrop" onClick={() => setSelectedUserId(null)}>
           <section className="user-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-user-header">
-              <div className="voice-avatar">{selectedUser.name.slice(0, 1).toUpperCase()}</div>
+              <UserAvatarView className="voice-avatar" user={selectedUser} />
               <div>
-                <h3>{selectedUser.name}</h3>
-                <p>{selectedUser.muted ? "Muted" : "В голосовой комнате"}</p>
+                <h3>{selectedUser.nickname}</h3>
+                <p>{selectedUser.status || (selectedUser.muted ? "Muted" : "In voice")}</p>
                 {selectedUser.id !== currentUser.id && (
                   <p>
                     Connection: {peerStatuses[selectedUser.id]?.connectionState ?? "not connected"} · ICE:{" "}
@@ -1232,25 +1941,21 @@ function App() {
             </div>
 
             {selectedUser.id !== currentUser.id ? (
-              <label className="modal-volume-control">
-                <span>Громкость: {userVolumes[selectedUser.id] ?? 100}%</span>
-                <input
-                  aria-label={`Volume for ${selectedUser.name}`}
-                  max={200}
-                  min={0}
-                  onChange={(event) => changeUserVolume(selectedUser.id, Number(event.target.value))}
-                  step={5}
-                  type="range"
-                  value={userVolumes[selectedUser.id] ?? 100}
-                />
-              </label>
+              <SettingsSlider
+                ariaLabel={`Volume for ${selectedUser.nickname}`}
+                className="modal-volume-control"
+                label="Volume"
+                max={1000}
+                min={0}
+                onChange={(value) => changeUserVolume(selectedUser.id, value)}
+                step={5}
+                value={userVolumes[selectedUser.id] ?? 100}
+              />
             ) : (
-              <p className="modal-note">Это вы.</p>
+              <p className="modal-note">This is you.</p>
             )}
 
-            <button className="modal-close" onClick={() => setSelectedUserId(null)}>
-              Закрыть
-            </button>
+            <button className="modal-close" onClick={() => setSelectedUserId(null)}>Close</button>
           </section>
         </div>
       )}
@@ -1258,40 +1963,201 @@ function App() {
       {settingsOpen && (
         <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
           <section className="settings-modal" onClick={(event) => event.stopPropagation()}>
+            <nav className="settings-tabs" aria-label="Settings sections">
+              <button className={settingsTab === "profile" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("profile")} title="Profile">
+                <UserRound size={22} />
+              </button>
+              <button className={settingsTab === "voice" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("voice")} title="Voice">
+                <Mic size={22} />
+              </button>
+              <button className={settingsTab === "sound" ? "settings-tab active" : "settings-tab"} onClick={() => setSettingsTab("sound")} title="Sound">
+                <Volume2 size={22} />
+              </button>
+            </nav>
+
+            <div className="settings-panel">
+              <button className="settings-x" onClick={() => setSettingsOpen(false)} title="Close">x</button>
+
+              {settingsTab === "profile" && currentUser && (
+                <section className="settings-section profile-section">
+                  <h3>Profile</h3>
+                  <div className="profile-layout">
+                    <div className="profile-fields">
+                      <label className="settings-field profile-edit-field">
+                        <span>Nickname <button className="inline-icon-button" onClick={() => startProfileEdit("nickname")} title="Edit nickname"><Pencil size={13} /></button></span>
+                        <input
+                          disabled={editingProfileField !== "nickname"}
+                          maxLength={50}
+                          onBlur={editingProfileField === "nickname" ? cancelProfileEdit : undefined}
+                          onChange={(event) => setProfileNickname(event.target.value)}
+                          onKeyDown={(event) => void saveProfileOnEnter(event, "nickname")}
+                          value={profileNickname}
+                        />
+                      </label>
+
+                      <label className="settings-field profile-edit-field">
+                        <span>Status <button className="inline-icon-button" onClick={() => startProfileEdit("status")} title="Edit status"><Pencil size={13} /></button></span>
+                        <input
+                          disabled={editingProfileField !== "status"}
+                          maxLength={50}
+                          onBlur={editingProfileField === "status" ? cancelProfileEdit : undefined}
+                          onChange={(event) => setProfileStatus(event.target.value)}
+                          onKeyDown={(event) => void saveProfileOnEnter(event, "status")}
+                          value={profileStatus}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="profile-avatar-wrap">
+                      <UserAvatarView className="profile-avatar" user={currentUser} />
+                      <div className="profile-avatar-actions">
+                        <label className="profile-avatar-action" title="Edit avatar">
+                          <Pencil size={18} />
+                          <input
+                            accept="image/jpeg,image/png,image/webp,image/gif"
+                            disabled={avatarSaving}
+                            onChange={(event) => {
+                              openAvatarCrop(event.target.files?.[0] ?? null);
+                              event.target.value = "";
+                            }}
+                            type="file"
+                          />
+                        </label>
+                        <button className="profile-avatar-action" disabled={avatarSaving} onClick={deleteAvatar} title="Delete avatar">
+                          <Trash2 size={18} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button className="settings-secondary-button danger-action settings-logout-button" onClick={() => setLogoutConfirmOpen(true)}>
+                    Log out
+                  </button>
+                </section>
+              )}
+
+              {settingsTab === "voice" && (
+                <section className="settings-section">
+                  <h3>Voice</h3>
+                  <label className="settings-field compact-settings-field">
+                    <span>Noise filter</span>
+                    <select
+                      disabled={inVoice}
+                      onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
+                      value={noiseMode}
+                    >
+                      <option value="rnnoise">RNNoise</option>
+                      <option value="browser">Browser audio</option>
+                    </select>
+                  </label>
+                  {inVoice && <p className="modal-note">Change the filter before joining voice.</p>}
+                </section>
+              )}
+
+              {settingsTab === "sound" && (
+                <section className="settings-section">
+                  <h3>Sound</h3>
+                  <SettingsSlider
+                    ariaLabel="UI sound volume"
+                    className="sound-settings-field"
+                    label="UI"
+                    max={400}
+                    min={0}
+                    onChange={setUiSoundVolume}
+                    step={10}
+                    value={uiSoundVolume}
+                  />
+                </section>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {avatarDraft && (
+        <div className="modal-backdrop" onClick={closeAvatarCrop}>
+          <section className="avatar-crop-modal" onClick={(event) => event.stopPropagation()}>
             <div>
-              <h3>Настройки</h3>
-              <p>Аудио</p>
+              <h3>Avatar</h3>
+              <p>Choose visible area</p>
+            </div>
+
+            <div
+              className="avatar-crop-frame"
+              onPointerDown={(event) => {
+                avatarDragRef.current = { x: event.clientX, y: event.clientY };
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                const lastPoint = avatarDragRef.current;
+                if (!lastPoint) {
+                  return;
+                }
+                moveAvatarCrop(event.clientX - lastPoint.x, event.clientY - lastPoint.y);
+                avatarDragRef.current = { x: event.clientX, y: event.clientY };
+              }}
+              onPointerUp={() => {
+                avatarDragRef.current = null;
+              }}
+            >
+              {avatarPreviewMode === "image" ? (
+                <img
+                  alt=""
+                  draggable={false}
+                  onLoad={(event) => updateAvatarNaturalSize(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
+                  src={avatarDraft.url}
+                  style={avatarPreviewStyle(avatarDraft, avatarCropZoom, avatarCropOffset)}
+                />
+              ) : (
+                <canvas
+                  aria-label="Avatar preview"
+                  height={AVATAR_PREVIEW_SIZE}
+                  ref={avatarCanvasRef}
+                  width={AVATAR_PREVIEW_SIZE}
+                />
+              )}
             </div>
 
             <label className="settings-field">
-              <span>Noise filter</span>
-              <select
-                disabled={inVoice}
-                onChange={(event) => setNoiseMode(event.target.value as NoiseMode)}
-                value={noiseMode}
-              >
-                <option value="rnnoise">RNNoise</option>
-                <option value="browser">Browser audio</option>
-              </select>
-            </label>
-
-            <label className="settings-field">
-              <span>UI sounds: {uiSoundVolume}%</span>
+              <span>Zoom</span>
               <input
-                max={400}
-                min={0}
-                onChange={(event) => setUiSoundVolume(Number(event.target.value))}
-                step={10}
+                max={3}
+                min={1}
+                onChange={(event) => setClampedAvatarZoom(Number(event.target.value))}
+                step={0.01}
                 type="range"
-                value={uiSoundVolume}
+                value={avatarCropZoom}
               />
             </label>
 
-            {inVoice && <p className="modal-note">Фильтр можно менять только до входа в голос.</p>}
+            <div className="avatar-crop-actions">
+              <button className="settings-secondary-button" disabled={avatarSaving} onClick={closeAvatarCrop}>
+                Cancel
+              </button>
+              <button className="settings-secondary-button" disabled={avatarSaving} onClick={confirmAvatarCrop}>
+                {avatarSaving ? "Saving" : "Save avatar"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
-            <button className="modal-close" onClick={() => setSettingsOpen(false)}>
-              Закрыть
-            </button>
+      {logoutConfirmOpen && (
+        <div className="modal-backdrop" onClick={() => setLogoutConfirmOpen(false)}>
+          <section className="confirm-modal" onClick={(event) => event.stopPropagation()}>
+            <div>
+              <h3>Sign out</h3>
+              <p>You will leave voice and need to sign in again.</p>
+            </div>
+
+            <div className="confirm-actions">
+              <button className="settings-secondary-button" onClick={() => setLogoutConfirmOpen(false)}>
+                Cancel
+              </button>
+              <button className="settings-secondary-button danger-action" onClick={handleLogout}>
+                Sign out
+              </button>
+            </div>
           </section>
         </div>
       )}
@@ -1337,6 +2203,172 @@ function StatusLine({ status, error }: { status: string; error: string | null })
   );
 }
 
+function SettingsSlider({
+  ariaLabel,
+  className,
+  label,
+  max,
+  min,
+  onChange,
+  step,
+  value
+}: {
+  ariaLabel: string;
+  className?: string;
+  label: string;
+  max: number;
+  min: number;
+  onChange: (value: number) => void;
+  step: number;
+  value: number;
+}) {
+  return (
+    <label className={["settings-slider", className].filter(Boolean).join(" ")}>
+      <span>{label}</span>
+      <div className="settings-slider-row">
+        <span aria-hidden="true">-</span>
+        <input
+          aria-label={ariaLabel}
+          max={max}
+          min={min}
+          onChange={(event) => onChange(Number(event.target.value))}
+          step={step}
+          type="range"
+          value={value}
+        />
+        <span aria-hidden="true">+</span>
+      </div>
+    </label>
+  );
+}
+
+function UserAvatarView({ user, className }: { user: Pick<User, "id" | "nickname" | "avatarUpdatedAt">; className: string }) {
+  const src = user.avatarUpdatedAt
+    ? `/api/users/${encodeURIComponent(user.id)}/avatar?v=${encodeURIComponent(user.avatarUpdatedAt)}`
+    : null;
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const visibleSrc = src && failedSrc !== src ? src : null;
+
+  useEffect(() => {
+    setFailedSrc(null);
+  }, [src]);
+
+  return (
+    <div className={className}>
+      {visibleSrc ? <img alt="" onError={() => setFailedSrc(visibleSrc)} src={visibleSrc} /> : user.nickname.slice(0, 1).toUpperCase()}
+    </div>
+  );
+}
+
+function clampAvatarOffset(offset: Point, zoom: number, draft: AvatarDraft | null): Point {
+  if (!draft || draft.naturalWidth <= 0 || draft.naturalHeight <= 0) {
+    return offset;
+  }
+  const scale = avatarBaseScale(draft) * zoom;
+  const maxX = Math.max(0, (draft.naturalWidth * scale - AVATAR_CROP_SIZE) / 2);
+  const maxY = Math.max(0, (draft.naturalHeight * scale - AVATAR_CROP_SIZE) / 2);
+  return {
+    x: Math.min(maxX, Math.max(-maxX, offset.x)),
+    y: Math.min(maxY, Math.max(-maxY, offset.y))
+  };
+}
+
+function avatarBaseScale(draft: AvatarDraft) {
+  return Math.max(AVATAR_CROP_SIZE / draft.naturalWidth, AVATAR_CROP_SIZE / draft.naturalHeight);
+}
+
+function avatarPreviewStyle(draft: AvatarDraft, zoom: number, offset: Point): React.CSSProperties {
+  if (draft.naturalWidth <= 0 || draft.naturalHeight <= 0) {
+    return {};
+  }
+  const scale = avatarBaseScale(draft) * zoom;
+  return {
+    height: `${draft.naturalHeight * scale}px`,
+    transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`,
+    width: `${draft.naturalWidth * scale}px`
+  };
+}
+
+function drawAvatarPreview(
+  image: CanvasImageSource,
+  canvas: HTMLCanvasElement | null,
+  naturalWidth: number,
+  naturalHeight: number,
+  zoom: number,
+  offset: Point
+) {
+  if (!canvas || naturalWidth <= 0 || naturalHeight <= 0) {
+    return;
+  }
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return;
+  }
+  const pixelRatio = window.devicePixelRatio || 1;
+  const targetSize = AVATAR_PREVIEW_SIZE * pixelRatio;
+  if (canvas.width !== targetSize || canvas.height !== targetSize) {
+    canvas.width = targetSize;
+    canvas.height = targetSize;
+  }
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  context.clearRect(0, 0, AVATAR_PREVIEW_SIZE, AVATAR_PREVIEW_SIZE);
+  const scale = Math.max(AVATAR_CROP_SIZE / naturalWidth, AVATAR_CROP_SIZE / naturalHeight) * zoom;
+  const width = naturalWidth * scale;
+  const height = naturalHeight * scale;
+  const x = AVATAR_PREVIEW_SIZE / 2 - width / 2 + offset.x;
+  const y = AVATAR_PREVIEW_SIZE / 2 - height / 2 + offset.y;
+  context.drawImage(image, x, y, width, height);
+}
+
+function avatarSourceCrop(draft: AvatarDraft, zoom: number, offset: Point): AvatarCrop {
+  const scale = avatarBaseScale(draft) * zoom;
+  const sourceSize = AVATAR_CROP_SIZE / scale;
+  const sourceX = clampNumber(
+    draft.naturalWidth / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.x) / scale,
+    0,
+    draft.naturalWidth - sourceSize
+  );
+  const sourceY = clampNumber(
+    draft.naturalHeight / 2 + (0 - AVATAR_CROP_SIZE / 2 - offset.y) / scale,
+    0,
+    draft.naturalHeight - sourceSize
+  );
+  return {
+    x: Math.max(0, Math.round(sourceX)),
+    y: Math.max(0, Math.round(sourceY)),
+    size: Math.max(1, Math.round(sourceSize))
+  };
+}
+
+async function createCroppedAvatarFile(draft: AvatarDraft, crop: AvatarCrop) {
+  const image = await loadImage(draft.url);
+  const canvas = document.createElement("canvas");
+  canvas.width = AVATAR_OUTPUT_SIZE;
+  canvas.height = AVATAR_OUTPUT_SIZE;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Canvas is not available");
+  }
+  context.drawImage(image, crop.x, crop.y, crop.size, crop.size, 0, 0, AVATAR_OUTPUT_SIZE, AVATAR_OUTPUT_SIZE);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((result) => result ? resolve(result) : reject(new Error("Failed to prepare avatar")), "image/png", 0.92);
+  });
+  return new File([blob], "avatar.png", { type: "image/png" });
+}
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Failed to read avatar image"));
+    image.src = src;
+  });
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function readInviteToken() {
   const url = new URL(window.location.href);
   const queryToken = url.searchParams.get("invite");
@@ -1351,6 +2383,50 @@ function readInviteToken() {
 function webSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${window.location.host}/ws`;
+}
+
+async function apiJson<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers ?? {})
+    }
+  });
+
+  if (!response.ok) {
+    let message = response.status === 403 ? "403 Forbidden" : `Request failed: ${response.status}`;
+    try {
+      const payload = await response.json();
+      if (typeof payload?.message === "string" && payload.message.trim()) {
+        message = payload.message;
+      }
+    } catch {
+      // Non-JSON errors keep the status-based message.
+    }
+    throw new Error(message);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+function authHeaders(accessToken: string | null): HeadersInit {
+  return accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+}
+
+async function apiForm<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...init,
+    headers: {
+      ...(init.headers ?? {})
+    }
+  });
+  if (!response.ok) {
+    throw new Error(response.status === 403 ? "403 Forbidden" : `Request failed: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
 }
 
 function readStoredNumber(key: string, fallback: number) {
