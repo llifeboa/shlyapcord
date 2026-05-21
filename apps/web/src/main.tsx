@@ -143,6 +143,7 @@ function App() {
   const [inVoice, setInVoice] = useState(false);
   const [muted, setMuted] = useState(false);
   const [iceConfig, setIceConfig] = useState<IceConfig>({ iceServers: [] });
+  const iceConfigRef = useRef<IceConfig>({ iceServers: [] });
   const [noiseStatus, setNoiseStatus] = useState("RNNoise");
   const [noiseMode, setNoiseMode] = useState<NoiseMode>("rnnoise");
   const [uiSoundVolume, setUiSoundVolume] = useState(() => readStoredNumber(UI_SOUND_VOLUME_STORAGE_KEY, DEFAULT_UI_SOUND_VOLUME));
@@ -251,6 +252,10 @@ function App() {
   }, [signalingState]);
 
   useEffect(() => {
+    iceConfigRef.current = iceConfig;
+  }, [iceConfig]);
+
+  useEffect(() => {
     voiceLog("Loading ICE config from /api/ice");
 
     fetch("/api/ice")
@@ -273,21 +278,28 @@ function App() {
           if (!config.iceServers || config.iceServers.length === 0) {
             voiceWarn("/api/ice returned empty iceServers, using fallback STUN");
 
-            setIceConfig({
+            const fallbackIceConfig = {
               iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-            });
+            };
+
+            iceConfigRef.current = fallbackIceConfig;
+            setIceConfig(fallbackIceConfig);
 
             return;
           }
 
+          iceConfigRef.current = config;
           setIceConfig(config);
         })
         .catch((exception) => {
           voiceError("/api/ice failed, using fallback STUN", exception);
 
-          setIceConfig({
+          const fallbackIceConfig = {
             iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-          });
+          };
+
+          iceConfigRef.current = fallbackIceConfig;
+          setIceConfig(fallbackIceConfig);
         });
 
     void restoreSessionOrCheckInvite();
@@ -447,13 +459,22 @@ function App() {
   }, [inVoice, peerStatuses]);
 
 
+  function safeJson(data: unknown) {
+    try {
+      return JSON.stringify(data, null, 2);
+    } catch {
+      return String(data);
+    }
+  }
+
   function voiceLog(label: string, data?: unknown) {
     const time = new Date().toISOString();
     if (data === undefined) {
       console.log(`[VOICE ${time}] ${label}`);
       return;
     }
-    console.log(`[VOICE ${time}] ${label}`, data);
+    console.log(`[VOICE ${time}] ${label}
+${safeJson(data)}`);
   }
 
   function voiceWarn(label: string, data?: unknown) {
@@ -462,7 +483,8 @@ function App() {
       console.warn(`[VOICE ${time}] ${label}`);
       return;
     }
-    console.warn(`[VOICE ${time}] ${label}`, data);
+    console.warn(`[VOICE ${time}] ${label}
+${safeJson(data)}`);
   }
 
   function voiceError(label: string, data?: unknown) {
@@ -471,7 +493,8 @@ function App() {
       console.error(`[VOICE ${time}] ${label}`);
       return;
     }
-    console.error(`[VOICE ${time}] ${label}`, data);
+    console.error(`[VOICE ${time}] ${label}
+${safeJson(data)}`);
   }
 
   function summarizeIceCandidate(candidate: RTCIceCandidateInit | RTCIceCandidate | null) {
@@ -1142,7 +1165,8 @@ function App() {
       currentUserId: currentUserRef.current?.id,
       signalingState: signalingStateRef.current,
       socketReadyState: socketRef.current?.readyState,
-      iceConfig,
+      iceConfigState: iceConfig,
+      iceConfigRef: iceConfigRef.current,
       existingLocalStream: Boolean(localStreamRef.current)
     });
 
@@ -1402,11 +1426,14 @@ function App() {
       return existing;
     }
 
+    const activeIceConfig = iceConfigRef.current;
+
     voiceLog("Creating RTCPeerConnection", {
       remoteUserId,
       currentUserId: currentUserRef.current?.id,
       shouldInitiateOffer: shouldInitiateOffer(remoteUserId),
-      iceConfig,
+      iceConfigState: iceConfig,
+      iceConfigRef: activeIceConfig,
       localStreamExists: Boolean(localStreamRef.current),
       localTracks: localStreamRef.current?.getTracks().map((track) => ({
         id: track.id,
@@ -1419,7 +1446,7 @@ function App() {
       }))
     });
 
-    const peer = new RTCPeerConnection(iceConfig);
+    const peer = new RTCPeerConnection(activeIceConfig);
     updatePeerStatus(remoteUserId, peer);
 
     localStreamRef.current?.getTracks().forEach((track) => {
